@@ -28,4 +28,5 @@ for s1name in "${s1names[@]}"; do
 
     python Sentinel_1_specific_name_download_process.py "$s1name" "$path"
     python cal_LIA.py "$s1name" "$path"
+    python Snow_detect.py "$s1name" "$path"
 done

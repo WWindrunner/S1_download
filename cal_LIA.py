@@ -27,10 +27,13 @@ if len(sys.argv) != 3:
     sys.exit(1)
 
 S1name = sys.argv[1]
-folder = sys.argv[2]
+folder = os.path.abspath(os.path.expanduser(sys.argv[2]))
 path = os.path.join(folder, S1name)
 
 print(f"Path: {path}")
+
+if not os.path.isdir(path):
+    raise FileNotFoundError(f"S1 product folder not found: {path}")
 
 #path = "/tank/data/SFS/xinyis/zhao89/data/Sentinel_1/specific_images/S1A_IW_GRDH_1SDV_20231104T091539_20231104T091604_051065_06285B_6CA3/"
 

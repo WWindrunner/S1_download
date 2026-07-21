@@ -207,19 +207,16 @@ if len(sys.argv) != 3:
     )
     sys.exit(1)
 
-S1names = sys.argv[1].split(",")
-folder = sys.argv[2]
+S1names = [name.strip() for name in sys.argv[1].split(",") if name.strip()]
+folder = os.path.abspath(os.path.expanduser(sys.argv[2]))
 
 os.makedirs(folder, exist_ok=True)
 
 print(f"Processing: {S1names}")
 print(f"Output folder: {folder}")
 
-#folder = f"/tank/data/SFS/xinyis/FS650/maopuxu/lab_2/past_events/20260616"
-os.makedirs(folder, exist_ok=True) 
-
 for S1name in S1names:
-    workfolder = folder + "/" + f'{S1name}/'
+    workfolder = os.path.join(folder, S1name)
     os.makedirs(workfolder, exist_ok=True) 
 
     df = search_sentinel_with_S1name(S1name)
@@ -238,7 +235,7 @@ for S1name in S1names:
                 ids = row["Id"]
                 name = row["Name"]
                 Sentinel_ori_dir = workfolder
-                Sentinel_1_GRD_file = workfolder + f'{name}.zip'            
+                Sentinel_1_GRD_file = os.path.join(workfolder, f'{name}.zip')
                 if not os.path.exists(Sentinel_1_GRD_file):
                     access_token = log_in(username,password)
                     download_Sentinel_with_ids_names(ids, name, Sentinel_ori_dir, access_token)

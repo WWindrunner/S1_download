@@ -11,14 +11,31 @@ from datetime import datetime, timedelta
 import math
 import time
 import re
+import sys
 from collections import defaultdict
 import numpy as np
 from osgeo import gdal
 gdal.UseExceptions()
 import shutil
 
-safe_dir = "/tank/data/SFS/xinyis/zhao89/data/Sentinel_1/specific_images/S1A_IW_GRDH_1SDV_20240514T170238_20240514T170303_053870_068C21_0D83/"
-tifs = glob.glob(safe_dir + "*VV.tif")
+
+if len(sys.argv) != 3:
+    print(
+        "Usage: python Snow_detect.py "
+        "<S1_PRODUCT_NAME> <OUTPUT_FOLDER>"
+    )
+    sys.exit(1)
+
+S1name = sys.argv[1]
+folder = os.path.abspath(os.path.expanduser(sys.argv[2]))
+safe_dir = os.path.join(folder, S1name)
+
+print(f"Path: {safe_dir}")
+
+if not os.path.isdir(safe_dir):
+    raise FileNotFoundError(f"S1 product folder not found: {safe_dir}")
+
+tifs = glob.glob(os.path.join(safe_dir, "*VV.tif"))
 s1_file = tifs[0]
 workspace = os.path.join(safe_dir, "snow_temp")
 os.makedirs(workspace, exist_ok=True)
@@ -76,7 +93,7 @@ for product in search_results:
 
 mosaic_dir = os.path.join(workspace, "Daily_Mosaic_S1grid")
 os.makedirs(mosaic_dir, exist_ok=True)
-snow_out = os.path.join(safe_dir, "Snow_occurrence.tif")
+snow_out = os.path.join(safe_dir, f"{S1name}_ice.tif")
 s1_ds = gdal.Open(s1_file)
 s1_proj = s1_ds.GetProjection()
 s1_gt = s1_ds.GetGeoTransform()
@@ -178,6 +195,17 @@ band.FlushCache()
 out_ds=None
 
 shutil.rmtree(workspace)
+
+cleanup_patterns = [
+    "*.zip",
+    "*incidenceAngleFromEllipsoid.tif",
+    "*localIncidenceAngle.tif",
+]
+
+for pattern in cleanup_patterns:
+    for file_path in glob.glob(os.path.join(safe_dir, pattern)):
+        os.remove(file_path)
+        print(f"Removed intermediate file: {file_path}")
 
 
 print("\nFinished:")
