@@ -39,6 +39,44 @@ tifs = glob.glob(os.path.join(safe_dir, "*VV.tif"))
 s1_file = tifs[0]
 workspace = os.path.join(safe_dir, "snow_temp")
 os.makedirs(workspace, exist_ok=True)
+snow_out = os.path.join(safe_dir, f"{S1name}_ice.tif")
+
+
+def cleanup_intermediate_files():
+    if os.path.isdir(workspace):
+        shutil.rmtree(workspace)
+
+    cleanup_patterns = [
+        "*.zip",
+        "*incidenceAngleFromEllipsoid.tif",
+        "*localIncidenceAngle.tif",
+    ]
+
+    for pattern in cleanup_patterns:
+        for file_path in glob.glob(os.path.join(safe_dir, pattern)):
+            os.remove(file_path)
+            print(f"Removed intermediate file: {file_path}")
+
+
+def create_nodata_ice_raster():
+    s1_ds = gdal.Open(s1_file)
+    driver = gdal.GetDriverByName("GTiff")
+    out_ds = driver.Create(
+        snow_out,
+        s1_ds.RasterXSize,
+        s1_ds.RasterYSize,
+        1,
+        gdal.GDT_Float32,
+        options=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"]
+    )
+    out_ds.SetGeoTransform(s1_ds.GetGeoTransform())
+    out_ds.SetProjection(s1_ds.GetProjection())
+    band = out_ds.GetRasterBand(1)
+    band.SetNoDataValue(-9999)
+    band.Fill(-9999)
+    band.FlushCache()
+    out_ds = None
+    s1_ds = None
 
 
 zip_path = glob.glob(os.path.join(safe_dir, "*.zip"))[0]
@@ -67,7 +105,15 @@ search_results = dag.search_all(
 n = len(search_results)
 print(n)
 if not search_results:
-    raise ValueError("No Sentinel-2 products found for given criteria.")
+    print(
+        "WARNING: No Sentinel-2 products found for the search period and "
+        "area. Creating a nodata ice raster."
+    )
+    create_nodata_ice_raster()
+    cleanup_intermediate_files()
+    print("\nFinished with no Sentinel-2 observations:")
+    print(snow_out)
+    sys.exit(0)
 
 start_time = time.perf_counter()
 
@@ -93,7 +139,6 @@ for product in search_results:
 
 mosaic_dir = os.path.join(workspace, "Daily_Mosaic_S1grid")
 os.makedirs(mosaic_dir, exist_ok=True)
-snow_out = os.path.join(safe_dir, f"{S1name}_ice.tif")
 s1_ds = gdal.Open(s1_file)
 s1_proj = s1_ds.GetProjection()
 s1_gt = s1_ds.GetGeoTransform()
@@ -194,18 +239,7 @@ band.SetNoDataValue(-9999)
 band.FlushCache()
 out_ds=None
 
-shutil.rmtree(workspace)
-
-cleanup_patterns = [
-    "*.zip",
-    "*incidenceAngleFromEllipsoid.tif",
-    "*localIncidenceAngle.tif",
-]
-
-for pattern in cleanup_patterns:
-    for file_path in glob.glob(os.path.join(safe_dir, pattern)):
-        os.remove(file_path)
-        print(f"Removed intermediate file: {file_path}")
+cleanup_intermediate_files()
 
 
 print("\nFinished:")

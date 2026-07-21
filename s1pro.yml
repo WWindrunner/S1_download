@@ -56,7 +56,6 @@ dependencies:
   - cyrus-sasl=2.1.28
   - dill=0.4.0
   - ecmwf-api-client=1.6.5
-  - eodag=4.3.1
   - fmt=11.2.0
   - folium=0.20.0
   - font-ttf-dejavu-sans-mono=2.37
@@ -231,7 +230,6 @@ dependencies:
   - python-utils=3.9.1
   - python_abi=3.12
   - pytz=2024.1
-  - pyyaml=6.0.2
   - qhull=2020.2
   - rasterio=1.4.3
   - re2=2025.07.22
@@ -331,6 +329,7 @@ dependencies:
       - eccodeslib==2.47.1.20
       - eckitlib==2.0.7.20
       - eerepr==0.1.2
+      - eodag==4.5.0
       - eodag-cube==0.7.1
       - esa-snappy==1.1.0
       - executing==2.2.1
@@ -426,6 +425,7 @@ dependencies:
       - pyperclip==1.11.0
       - pyshp==3.0.9
       - pystac-client==0.9.0
+      - PyYAML==6.0.3
       - python-box==7.4.1
       - python-dotenv==1.2.2
       - python-json-logger==4.1.0
