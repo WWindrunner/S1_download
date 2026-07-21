@@ -12,11 +12,15 @@ For each Sentinel-1 product name, the workflow runs the following steps:
      Data Space.
    - Uses SNAP through pyroSAR to process VV and VH backscatter.
    - Produces the incidence-angle rasters required by the next step.
-2. `cal_LIA.py`
+2. `Desert_mask.py`
+   - Clips and reprojects the external global desert-mask VRT to the
+     Sentinel-1 grid.
+   - Preserves the mask classes using nearest-neighbour resampling.
+3. `cal_LIA.py`
    - Downloads Copernicus DEM tiles from Microsoft Planetary Computer.
    - Resamples the DEM to the Sentinel-1 grid and calculates local incidence
      angle (LIA).
-3. `Snow_detect.py`
+4. `Snow_detect.py`
    - Searches for Sentinel-2 L2A products from the 15 days before the
      Sentinel-1 acquisition.
    - Uses the Sentinel-2 Scene Classification Layer (SCL) to calculate snow
@@ -46,6 +50,7 @@ Copernicus Data Space credentials are currently configured in
 Edit `execute.sh` before submission:
 
 - Set `path` to the output root directory.
+- Set `desert_mask_vrt` to the external global desert-mask VRT.
 - Add one or more Sentinel-1 product names to the `s1names` array.
 - Update the Conda, project, SNAP, Slurm partition, and log paths when running
   on a different system.
@@ -56,10 +61,11 @@ Submit the workflow with:
 sbatch execute.sh
 ```
 
-The three stages can also be run manually:
+The four stages can also be run manually:
 
 ```bash
 python Sentinel_1_specific_name_download_process.py <S1_PRODUCT_NAME> <OUTPUT_FOLDER>
+python Desert_mask.py <S1_PRODUCT_NAME> <OUTPUT_FOLDER> <DESERT_MASK_VRT>
 python cal_LIA.py <S1_PRODUCT_NAME> <OUTPUT_FOLDER>
 python Snow_detect.py <S1_PRODUCT_NAME> <OUTPUT_FOLDER>
 ```
@@ -73,6 +79,7 @@ Each Sentinel-1 product is written to its own subdirectory:
 +-- <S1_PRODUCT_NAME>/
     +-- Gamma0_VV.tif
     +-- Gamma0_VH.tif
+    +-- <S1_PRODUCT_NAME>_desert.tif
     +-- <S1_PRODUCT_NAME>_LIA.tif
     +-- <S1_PRODUCT_NAME>_ice.tif
 ```
