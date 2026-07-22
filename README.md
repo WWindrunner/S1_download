@@ -25,7 +25,7 @@ For each Sentinel-1 product name, the workflow runs the following steps:
      Sentinel-1 acquisition.
    - Uses the Sentinel-2 Scene Classification Layer (SCL) to calculate snow
      occurrence on the Sentinel-1 grid.
-   - Removes downloaded ZIP files and intermediate incidence-angle rasters
+   - Removes downloaded ZIP files, DEM tiles, and SNAP/intermediate rasters
      after successful completion.
 
 ## Environment
@@ -84,4 +84,4 @@ Each Sentinel-1 product is written to its own subdirectory:
     +-- <S1_PRODUCT_NAME>_ice.tif
 ```
 
-Additional SNAP output files may also be present in the product directory.
+Intermediate SNAP output files are removed after successful completion.

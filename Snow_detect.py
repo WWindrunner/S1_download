@@ -18,6 +18,9 @@ from osgeo import gdal
 gdal.UseExceptions()
 import shutil
 import traceback
+import urllib.request
+
+import planetary_computer
 
 
 if len(sys.argv) != 3:
@@ -51,12 +54,37 @@ def cleanup_intermediate_files():
         "*.zip",
         "*incidenceAngleFromEllipsoid.tif",
         "*localIncidenceAngle.tif",
+        "*_manifest.safe",
+        "*_proc.xml",
+        "*_gamma0-elp.tif",
     ]
 
     for pattern in cleanup_patterns:
         for file_path in glob.glob(os.path.join(safe_dir, pattern)):
             os.remove(file_path)
             print(f"Removed intermediate file: {file_path}")
+
+    dem_tiles = os.path.join(safe_dir, "dem_tiles")
+    if os.path.isdir(dem_tiles):
+        shutil.rmtree(dem_tiles)
+        print(f"Removed intermediate directory: {dem_tiles}")
+
+
+def download_scl_asset(scl_href, scl_file):
+    """Download one Planetary Computer asset without EODAG's auth headers."""
+    signed_href = planetary_computer.sign_url(scl_href)
+    os.makedirs(os.path.dirname(scl_file), exist_ok=True)
+    partial_file = f"{scl_file}.part"
+    try:
+        with urllib.request.urlopen(signed_href, timeout=300) as response:
+            with open(partial_file, "wb") as output:
+                shutil.copyfileobj(response, output)
+        os.replace(partial_file, scl_file)
+    finally:
+        if os.path.exists(partial_file):
+            os.remove(partial_file)
+
+    return scl_file
 
 
 def create_nodata_ice_raster():
@@ -147,7 +175,7 @@ for product in search_results:
 
     product_start_time = time.perf_counter()
     try:
-        downloaded_path = dag.download(product, asset=r"^SCL_20m$")
+        downloaded_path = download_scl_asset(scl_href, scl_file)
         elapsed = time.perf_counter() - product_start_time
         print(f"Downloaded: {downloaded_path}")
         print(f"Download time: {elapsed:.2f} seconds")
