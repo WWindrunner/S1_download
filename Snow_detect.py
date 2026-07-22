@@ -17,6 +17,7 @@ import numpy as np
 from osgeo import gdal
 gdal.UseExceptions()
 import shutil
+import traceback
 
 
 if len(sys.argv) != 3:
@@ -115,10 +116,11 @@ if not search_results:
     print(snow_out)
     sys.exit(0)
 
-start_time = time.perf_counter()
-
 for product in search_results:
-    product_name = product.properties["title"]
+    product_name = product.properties.get(
+        "title",
+        product.properties.get("id", "unknown_product")
+    )
     scl_file = os.path.join(
         workspace,
         product_name,
@@ -128,14 +130,36 @@ for product in search_results:
     if os.path.exists(scl_file):
         print(f"Already exists, skip: {product_name}")
         continue
-     
+
+    scl_asset = product.assets.get("SCL_20m")
+    if scl_asset is None:
+        print(f"Download skipped for {product_name}: SCL_20m asset is missing")
+        print(f"Available assets: {list(product.assets.keys())}")
+        continue
+
+    scl_href = scl_asset.get("href")
+    if not isinstance(scl_href, str) or not scl_href:
+        print(
+            f"Download skipped for {product_name}: "
+            f"SCL_20m has an invalid href: {scl_href!r}"
+        )
+        continue
+
+    product_start_time = time.perf_counter()
     try:
-        dag.download(product, asset=r"SCL_20m")
-        end_time = time.perf_counter()
+        downloaded_path = dag.download(product, asset=r"^SCL_20m$")
+        elapsed = time.perf_counter() - product_start_time
+        print(f"Downloaded: {downloaded_path}")
+        print(f"Download time: {elapsed:.2f} seconds")
     except Exception as e:
-        print("download failed:", e)
-        time.sleep(10)    
-    print(f"Download time: {end_time - start_time:.2f} seconds")
+        elapsed = time.perf_counter() - product_start_time
+        print(
+            f"Download failed for {product_name} after {elapsed:.2f} seconds: "
+            f"{type(e).__name__}: {e}"
+        )
+        traceback.print_exc()
+        time.sleep(10)
+        continue
 
 mosaic_dir = os.path.join(workspace, "Daily_Mosaic_S1grid")
 os.makedirs(mosaic_dir, exist_ok=True)
