@@ -19,10 +19,34 @@ cd /tank/data/SFS/xinyis/FS650/maopuxu/lab_2/src
 
 path="/tank/data/SFS/xinyis/FS650/maopuxu/lab_2/past_events/20260616_mask"
 desert_mask_vrt="/path/to/global_desert_mask.vrt"
+extent_file="/path/to/search_extent.tif"
+start_date="2025-11-15"
+end_date="2025-11-20"
 
-s1names=(
-"S1A_IW_GRDH_1SDV_20240301T020957_20240301T021022_052782_066322_5F93"
-)
+# Manual product-name input (kept as a reference):
+# s1names=(
+# "S1A_IW_GRDH_1SDV_20240301T020957_20240301T021022_052782_066322_5F93"
+# )
+
+search_output=$(python Sentinel_1_search_by_extent.py \
+    "$extent_file" \
+    "$start_date" \
+    "$end_date" \
+    --names-only)
+search_status=$?
+
+if [ "$search_status" -ne 0 ]; then
+    echo "Sentinel-1 image search failed."
+    exit "$search_status"
+fi
+
+if [ -z "$search_output" ]; then
+    echo "No Sentinel-1 images found for the specified extent and date range."
+    exit 0
+fi
+
+mapfile -t s1names <<< "$search_output"
+echo "Found ${#s1names[@]} Sentinel-1 images."
 
 for s1name in "${s1names[@]}"; do
     echo "Processing $s1name"

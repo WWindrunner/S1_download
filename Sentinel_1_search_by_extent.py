@@ -142,6 +142,11 @@ if __name__ == "__main__":
         "end_date",
         help="Last acquisition date to include (YYYY-MM-DD).",
     )
+    parser.add_argument(
+        "--names-only",
+        action="store_true",
+        help="Print only product names, one per line, for use by other scripts.",
+    )
     args = parser.parse_args()
 
     names = search_sentinel_1_product_names(
@@ -149,7 +154,8 @@ if __name__ == "__main__":
         args.start_date,
         args.end_date,
     )
-    print(f"Search dates: {args.start_date} to {args.end_date}")
-    print(f"Found {len(names)} Sentinel-1 products:")
+    if not args.names_only:
+        print(f"Search dates: {args.start_date} to {args.end_date}")
+        print(f"Found {len(names)} Sentinel-1 products:")
     for name in names:
         print(name)
