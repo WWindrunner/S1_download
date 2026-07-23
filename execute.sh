@@ -15,6 +15,10 @@ desert_mask_vrt="/path/to/global_desert_mask.vrt"
 extent_file="/path/to/search_extent.tif"
 start_date="2025-11-15"
 end_date="2025-11-20"
+xmin="-95.0"
+xmax="-90.0"
+ymin="40.0"
+ymax="45.0"
 
 # Manual product-name input (kept as a reference):
 # s1names=(
@@ -25,6 +29,10 @@ search_output=$(python Sentinel_1_search_by_extent.py \
     "$extent_file" \
     "$start_date" \
     "$end_date" \
+    "$xmin" \
+    "$xmax" \
+    "$ymin" \
+    "$ymax" \
     --names-only)
 search_status=$?
 

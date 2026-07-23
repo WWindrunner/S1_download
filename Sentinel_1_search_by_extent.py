@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 from datetime import date, timedelta
 
 import geopandas as gpd
@@ -49,6 +50,50 @@ def read_search_extent(input_path):
     }
 
 
+def create_search_extent(xmin, xmax, ymin, ymax):
+    """Validate longitude/latitude bounds and return a search extent."""
+    try:
+        xmin = float(xmin)
+        xmax = float(xmax)
+        ymin = float(ymin)
+        ymax = float(ymax)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "xmin, xmax, ymin, and ymax must be numeric coordinates."
+        ) from exc
+
+    if not -180 <= xmin < xmax <= 180:
+        raise ValueError(
+            "Longitude bounds must satisfy -180 <= xmin < xmax <= 180."
+        )
+    if not -90 <= ymin < ymax <= 90:
+        raise ValueError(
+            "Latitude bounds must satisfy -90 <= ymin < ymax <= 90."
+        )
+
+    return {
+        "minx": xmin,
+        "miny": ymin,
+        "maxx": xmax,
+        "maxy": ymax,
+    }
+
+
+def resolve_search_extent(extent_file, xmin, xmax, ymin, ymax):
+    """Prefer a valid extent file and otherwise use coordinate bounds."""
+    if extent_file and str(extent_file).strip().lower() != "none":
+        input_path = os.path.abspath(os.path.expanduser(str(extent_file)))
+        if os.path.isfile(input_path):
+            return read_search_extent(input_path)
+
+        print(
+            f"Reference file not found; using coordinate bounds: {input_path}",
+            file=sys.stderr,
+        )
+
+    return create_search_extent(xmin, xmax, ymin, ymax)
+
+
 def parse_search_dates(start_date, end_date):
     """Validate YYYY-MM-DD dates and return an inclusive date range."""
     try:
@@ -65,7 +110,15 @@ def parse_search_dates(start_date, end_date):
     return start, end
 
 
-def search_sentinel_1_product_names(extent_file, start_date, end_date):
+def search_sentinel_1_product_names(
+    extent_file,
+    start_date,
+    end_date,
+    xmin=None,
+    xmax=None,
+    ymin=None,
+    ymax=None,
+):
     """
     Search Sentinel-1 IW GRDH products for an extent and inclusive date range.
 
@@ -77,13 +130,15 @@ def search_sentinel_1_product_names(extent_file, start_date, end_date):
         First acquisition date to include, formatted as YYYY-MM-DD.
     end_date : str
         Last acquisition date to include, formatted as YYYY-MM-DD.
+    xmin, xmax, ymin, ymax : float
+        Fallback rectangle bounds in longitude and latitude.
 
     Returns
     -------
     list[str]
         Unique Sentinel-1 product names without the trailing ``.SAFE``.
     """
-    bounds = read_search_extent(extent_file)
+    bounds = resolve_search_extent(extent_file, xmin, xmax, ymin, ymax)
     start, end = parse_search_dates(start_date, end_date)
     start_datetime = f"{start.isoformat()}T00:00:00.000Z"
     end_datetime = f"{(end + timedelta(days=1)).isoformat()}T00:00:00.000Z"
@@ -132,7 +187,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "extent_file",
-        help="Path to the input .shp, .tif, or .tiff extent file.",
+        help=(
+            "Path to an input .shp, .tif, or .tiff file. Use 'none' to "
+            "search with coordinate bounds."
+        ),
     )
     parser.add_argument(
         "start_date",
@@ -142,6 +200,10 @@ if __name__ == "__main__":
         "end_date",
         help="Last acquisition date to include (YYYY-MM-DD).",
     )
+    parser.add_argument("xmin", type=float, help="Minimum longitude.")
+    parser.add_argument("xmax", type=float, help="Maximum longitude.")
+    parser.add_argument("ymin", type=float, help="Minimum latitude.")
+    parser.add_argument("ymax", type=float, help="Maximum latitude.")
     parser.add_argument(
         "--names-only",
         action="store_true",
@@ -153,6 +215,10 @@ if __name__ == "__main__":
         args.extent_file,
         args.start_date,
         args.end_date,
+        args.xmin,
+        args.xmax,
+        args.ymin,
+        args.ymax,
     )
     if not args.names_only:
         print(f"Search dates: {args.start_date} to {args.end_date}")
