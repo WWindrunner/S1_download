@@ -1,11 +1,13 @@
 import os
 import sys
+import time
 import traceback
 
 from osgeo import gdal
 
 
 gdal.UseExceptions()
+start_time = time.perf_counter()
 
 
 if len(sys.argv) != 4:
@@ -104,9 +106,9 @@ try:
         warp_kwargs["srcNodata"] = source_nodata
         warp_kwargs["dstNodata"] = source_nodata
 
-    print(f"Reference raster: {reference_path}")
-    print(f"Desert mask: {desert_mask_vrt}")
-    print(f"Output raster: {output_path}")
+    # print(f"Reference raster: {reference_path}")
+    # print(f"Desert mask: {desert_mask_vrt}")
+    # print(f"Output raster: {output_path}")
 
     output_ds = gdal.Warp(
         output_path,
@@ -119,15 +121,16 @@ try:
     output_ds.FlushCache()
     output_ds = None
     desert_ds = None
-    print(f"Desert mask saved -> {output_path}")
+    elapsed = time.perf_counter() - start_time
+    print(f"Desert mask completed in {elapsed:.2f} seconds.")
 except Exception:
     print(
         "ERROR: Desert mask calculation failed. Creating an empty nodata mask ",
         "so processing can continue.",
         file=sys.stderr,
     )
-    traceback.print_exc()
+    # traceback.print_exc()
     create_nodata_desert_raster(reference_ds)
-    print(f"Empty desert mask saved -> {output_path}")
+    print("Empty desert mask created so processing can continue.")
 finally:
     reference_ds = None

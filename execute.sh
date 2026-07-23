@@ -48,6 +48,7 @@ fi
 
 mapfile -t s1names <<< "$search_output"
 echo "Found ${#s1names[@]} Sentinel-1 images."
+printf '  %s\n' "${s1names[@]}"
 
 for s1name in "${s1names[@]}"; do
     echo "Processing $s1name"

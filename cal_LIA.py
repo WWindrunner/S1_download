@@ -2,6 +2,7 @@ import glob
 import os
 import shutil
 import sys
+import time
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -12,6 +13,8 @@ from osgeo import gdal
 from pyroSAR import identify
 from pystac_client import Client
 from rasterio.warp import reproject, Resampling
+
+start_time = time.perf_counter()
 
 if len(sys.argv) != 3:
     print(
@@ -24,13 +27,13 @@ S1name = sys.argv[1]
 folder = os.path.abspath(os.path.expanduser(sys.argv[2]))
 path = os.path.join(folder, S1name)
 
-print(f"Path: {path}")
+# print(f"Path: {path}")
 
 if not os.path.isdir(path):
     raise FileNotFoundError(f"S1 product folder not found: {path}")
 
 zip_path = glob.glob(os.path.join(path, "*.zip"))[0]
-print(zip_path)
+# print(zip_path)
 scene = identify(zip_path)
 
 S1_angle_path = glob.glob(os.path.join(path, f"*incidenceAngleFromEllipsoid.tif"))[0]
@@ -65,7 +68,7 @@ items = list(search.items())
 if len(items) == 0:
     raise ValueError("No DEM tiles found")
 
-print(f"Found {len(items)} DEM tiles")
+print(f"DEM search completed: {len(items)} tiles found.")
 
 local_files = []
 
@@ -76,7 +79,7 @@ for i, item in enumerate(items):
 
     out_path = os.path.join(dem_dir, f"dem_{i}.tif")
 
-    print("Downloading:", url)
+    # print("Downloading:", url)
 
     r = requests.get(url, stream=True)
     r.raise_for_status()
@@ -87,7 +90,7 @@ for i, item in enumerate(items):
 
     local_files.append(out_path)
 
-print("Download complete:", len(local_files), "tiles")
+print(f"DEM download completed: {len(local_files)} tiles.")
 
 tif_list = glob.glob(os.path.join(dem_dir, "*.tif"))
 gdal.Warp(
@@ -101,7 +104,7 @@ gdal.Warp(
     ),
 )
 
-print("Done -> DEM_merged.tif")
+# print("DEM mosaic completed.")
 
 if os.path.exists(dem_dir):
     shutil.rmtree(dem_dir)
@@ -171,7 +174,7 @@ root = tree.getroot()
 # Read the orbit direction without depending on the XML namespace.
 for elem in root.iter():
     if elem.tag.endswith("pass"):
-        print(elem.text)
+        # print(elem.text)
         pass_dir = elem.text
 
 AZIMUTH = 102 if pass_dir == "ASCENDING" else 282
@@ -203,6 +206,7 @@ with rasterio.open(
 ) as dst:
     dst.write(lia.astype(np.float32), 1)
 
-print(f"LIA saved -> {LIA_path}")
+elapsed = time.perf_counter() - start_time
+print(f"Local incidence angle completed in {elapsed:.2f} seconds.")
 
 os.remove(dem_resample_path)

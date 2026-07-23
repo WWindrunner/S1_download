@@ -49,7 +49,7 @@ def download_Sentinel_with_ids_names(ids, name, output_dir, access_token):
         "Authorization": f"Bearer {access_token}"
     }
     output_filename = f"{name}.zip"
-    print(f"\nDownloading {output_filename}......", end="", flush=True)
+    print("Downloading Sentinel-1 product...", end="", flush=True)
     stdout.flush()
     output_path = os.path.join(output_dir, output_filename)
     os.makedirs(output_dir, exist_ok=True)
@@ -63,9 +63,9 @@ def download_Sentinel_with_ids_names(ids, name, output_dir, access_token):
                     f.write(chunk)
 
 
-            print(f"finished!")
+            print(" completed.")
         else:
-            print(f"Error ({r.status_code}): {r.text}")
+            print(f"Sentinel-1 download failed with status {r.status_code}.")
 
 def process_snentinel_images(file, processed_path):
     target_resolution = 20
@@ -155,7 +155,7 @@ folder = os.path.abspath(os.path.expanduser(sys.argv[2]))
 os.makedirs(folder, exist_ok=True)
 
 print(f"Processing: {S1names}")
-print(f"Output folder: {folder}")
+# print(f"Output folder: {folder}")
 
 for S1name in S1names:
     workfolder = os.path.join(folder, S1name)
@@ -179,14 +179,15 @@ for S1name in S1names:
                     access_token = log_in(username, password)
                     download_Sentinel_with_ids_names(ids, name, Sentinel_ori_dir, access_token)
                 else:
-                    print("Downloaded!")
+                    # print("Product already downloaded.")
+                    pass
 
-                print("Processing to Gamma0......", end="", flush=True)
+                print("Preprocessing SAR imagery...", end="", flush=True)
                 process_snentinel_images(Sentinel_1_GRD_file, workfolder)
                 incidence_process(workfolder)
 
                 interval_time = datetime.datetime.now()
-                print(f"finished in {interval_time - start_time_each_image}")
+                print(f" completed in {interval_time - start_time_each_image}.")
 
             except Exception as e:
                 print(f"Error processing {name}: {e}")

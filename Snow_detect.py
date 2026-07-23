@@ -16,6 +16,7 @@ from osgeo import gdal
 from pyroSAR import identify
 
 gdal.UseExceptions()
+start_time = time.perf_counter()
 
 if len(sys.argv) != 3:
     print(
@@ -28,7 +29,7 @@ S1name = sys.argv[1]
 folder = os.path.abspath(os.path.expanduser(sys.argv[2]))
 safe_dir = os.path.join(folder, S1name)
 
-print(f"Path: {safe_dir}")
+# print(f"Path: {safe_dir}")
 
 if not os.path.isdir(safe_dir):
     raise FileNotFoundError(f"S1 product folder not found: {safe_dir}")
@@ -56,12 +57,12 @@ def cleanup_intermediate_files():
     for pattern in cleanup_patterns:
         for file_path in glob.glob(os.path.join(safe_dir, pattern)):
             os.remove(file_path)
-            print(f"Removed intermediate file: {file_path}")
+            # print(f"Removed intermediate file: {file_path}")
 
     dem_tiles = os.path.join(safe_dir, "dem_tiles")
     if os.path.isdir(dem_tiles):
         shutil.rmtree(dem_tiles)
-        print(f"Removed intermediate directory: {dem_tiles}")
+        # print(f"Removed intermediate directory: {dem_tiles}")
 
 
 def download_scl_asset(scl_href, scl_file):
@@ -126,7 +127,7 @@ search_results = dag.search_all(
     geom=geom
 )
 n = len(search_results)
-print(n)
+print(f"Sentinel-2 search completed: {n} products found.")
 if not search_results:
     print(
         "WARNING: No Sentinel-2 products found for the search period and "
@@ -134,8 +135,8 @@ if not search_results:
     )
     create_nodata_ice_raster()
     cleanup_intermediate_files()
-    print("\nFinished with no Sentinel-2 observations:")
-    print(snow_out)
+    elapsed = time.perf_counter() - start_time
+    print(f"Empty snow mask completed in {elapsed:.2f} seconds.")
     sys.exit(0)
 
 for product in search_results:
@@ -148,15 +149,15 @@ for product in search_results:
         product_name,
         "SCL_20m.tif"
     )
-    print(scl_file)
+    # print(scl_file)
     if os.path.exists(scl_file):
-        print(f"Already exists, skip: {product_name}")
+        # print(f"Already exists, skip: {product_name}")
         continue
 
     scl_asset = product.assets.get("SCL_20m")
     if scl_asset is None:
-        print(f"Download skipped for {product_name}: SCL_20m asset is missing")
-        print(f"Available assets: {list(product.assets.keys())}")
+        # print(f"Download skipped for {product_name}: SCL_20m asset is missing")
+        # print(f"Available assets: {list(product.assets.keys())}")
         continue
 
     scl_href = scl_asset.get("href")
@@ -171,15 +172,15 @@ for product in search_results:
     try:
         downloaded_path = download_scl_asset(scl_href, scl_file)
         elapsed = time.perf_counter() - product_start_time
-        print(f"Downloaded: {downloaded_path}")
-        print(f"Download time: {elapsed:.2f} seconds")
+        # print(f"Downloaded: {downloaded_path}")
+        # print(f"Download time: {elapsed:.2f} seconds")
     except Exception as e:
         elapsed = time.perf_counter() - product_start_time
         print(
             f"Download failed for {product_name} after {elapsed:.2f} seconds: "
             f"{type(e).__name__}: {e}"
         )
-        traceback.print_exc()
+        # traceback.print_exc()
         time.sleep(10)
         continue
 
@@ -214,7 +215,7 @@ for date in sorted(date_dict.keys()):
     tif_list = date_dict[date]
     outfile = os.path.join(mosaic_dir, f"S2_{date}_S1grid.tif")
     if os.path.exists(outfile):
-        print("exist skip")
+        # print("Daily mosaic already exists.")
         continue
 
     gdal.Warp(
@@ -282,6 +283,6 @@ out_ds = None
 
 cleanup_intermediate_files()
 
-print("\nFinished:")
-print(snow_out)
+elapsed = time.perf_counter() - start_time
+print(f"Snow mask completed in {elapsed:.2f} seconds.")
 
