@@ -138,19 +138,22 @@ def incidence_process(VV_VH_incidence_path):
     ds1 = None
     ds2 = None
 
-# Copernicus Data Space credentials.
-username = "maopuxu@uwm.edu"
-password = "Xmp*20021109"
-
-if len(sys.argv) != 3:
+if len(sys.argv) != 5:
     print(
         "Usage: python Sentinel_1_specific_name_download_process.py "
-        "<S1_PRODUCT_NAME1,S1_PRODUCT_NAME2,...> <OUTPUT_FOLDER>"
+        "<S1_PRODUCT_NAME1,S1_PRODUCT_NAME2,...> <OUTPUT_FOLDER> "
+        "<USERNAME> <PASSWORD>"
     )
     sys.exit(1)
 
 S1names = [name.strip() for name in sys.argv[1].split(",") if name.strip()]
 folder = os.path.abspath(os.path.expanduser(sys.argv[2]))
+username = sys.argv[3]
+password = sys.argv[4]
+
+if not username or not password:
+    print("Copernicus Data Space username and password are required.")
+    sys.exit(1)
 
 os.makedirs(folder, exist_ok=True)
 

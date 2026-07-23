@@ -20,6 +20,15 @@ xmax="-90.0"
 ymin="40.0"
 ymax="45.0"
 
+# Copernicus Data Space credentials.
+username=""
+password=""
+
+if [ -z "$username" ] || [ -z "$password" ]; then
+    echo "Set the Copernicus Data Space username and password in execute.sh."
+    exit 1
+fi
+
 # Manual product-name input (kept as a reference):
 # s1names=(
 # "S1A_IW_GRDH_1SDV_20240301T020957_20240301T021022_052782_066322_5F93"
@@ -53,7 +62,11 @@ printf '  %s\n' "${s1names[@]}"
 for s1name in "${s1names[@]}"; do
     echo "Processing $s1name"
 
-    python Sentinel_1_specific_name_download_process.py "$s1name" "$path"
+    python Sentinel_1_specific_name_download_process.py \
+        "$s1name" \
+        "$path" \
+        "$username" \
+        "$password"
     python Desert_mask.py "$s1name" "$path" "$desert_mask_vrt"
     python cal_LIA.py "$s1name" "$path"
     python Snow_detect.py "$s1name" "$path"

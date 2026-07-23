@@ -42,8 +42,9 @@ available on `PATH`. The current server-specific SNAP path is set in
 `Sentinel_1_specific_name_download_process.py` and may need to be changed on a
 different system.
 
-Copernicus Data Space credentials are currently configured in
-`Sentinel_1_specific_name_download_process.py`.
+Copernicus Data Space credentials are passed to the download script as command
+line arguments. Set the empty `username` and `password` variables in
+`execute.sh` before running the workflow.
 
 ## Running the workflow
 
@@ -51,6 +52,7 @@ Edit `execute.sh` before submission:
 
 - Set `path` to the output root directory.
 - Set `desert_mask_vrt` to the external global desert-mask VRT.
+- Set `username` and `password` to your Copernicus Data Space credentials.
 - Add one or more Sentinel-1 product names to the `s1names` array.
 - Update the Conda, project, SNAP, Slurm partition, and log paths when running
   on a different system.
@@ -64,7 +66,8 @@ sbatch execute.sh
 The four stages can also be run manually:
 
 ```bash
-python Sentinel_1_specific_name_download_process.py <S1_PRODUCT_NAME> <OUTPUT_FOLDER>
+python Sentinel_1_specific_name_download_process.py \
+  <S1_PRODUCT_NAME> <OUTPUT_FOLDER> <USERNAME> <PASSWORD>
 python Desert_mask.py <S1_PRODUCT_NAME> <OUTPUT_FOLDER> <DESERT_MASK_VRT>
 python cal_LIA.py <S1_PRODUCT_NAME> <OUTPUT_FOLDER>
 python Snow_detect.py <S1_PRODUCT_NAME> <OUTPUT_FOLDER>
