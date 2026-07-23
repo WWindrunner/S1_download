@@ -264,10 +264,10 @@ for i,tif in enumerate(daily_files):
     valid_count += valid.astype(np.uint16)
     ds=None
 
-snow_frequency=np.zeros((s1_rows,s1_cols),dtype=np.float32)
+snow_mask=np.full((s1_rows,s1_cols),-9999,dtype=np.float32)
 idx=valid_count>0
 
-snow_frequency[idx]=(snow_count[idx]/valid_count[idx])
+snow_mask[idx]=(snow_count[idx]>0).astype(np.float32)
 
 driver=gdal.GetDriverByName("GTiff")
 
@@ -286,7 +286,7 @@ out_ds=driver.Create(
 out_ds.SetGeoTransform(s1_gt)
 out_ds.SetProjection(s1_proj)
 band=out_ds.GetRasterBand(1)
-band.WriteArray(snow_frequency)
+band.WriteArray(snow_mask)
 band.SetNoDataValue(-9999)
 band.FlushCache()
 out_ds=None
