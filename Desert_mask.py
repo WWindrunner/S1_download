@@ -51,8 +51,7 @@ def create_nodata_desert_raster(reference_ds):
     output_ds = None
 
 
-# Reading the reference raster is required even for the fallback because its
-# dimensions and georeferencing define the output grid.
+# The reference raster defines the output grid and fallback raster.
 reference_ds = gdal.Open(reference_path)
 if reference_ds is None:
     raise RuntimeError(f"Failed to open reference raster: {reference_path}")

@@ -1,27 +1,21 @@
-import os
-from eodag import EODataAccessGateway,setup_logging,SearchResult
-from eodag.utils import ProgressCallback
-import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
-from concurrent.futures import ThreadPoolExecutor
-from pyroSAR import identify
-from datetime import timedelta
-import glob
-from datetime import datetime, timedelta
-import math
-import time
-import re
-import sys
 from collections import defaultdict
-import numpy as np
-from osgeo import gdal
-gdal.UseExceptions()
+from datetime import datetime, timedelta
+import glob
+import os
+import re
 import shutil
+import sys
+import time
 import traceback
 import urllib.request
 
+import numpy as np
 import planetary_computer
+from eodag import EODataAccessGateway, setup_logging
+from osgeo import gdal
+from pyroSAR import identify
 
+gdal.UseExceptions()
 
 if len(sys.argv) != 3:
     print(
@@ -203,22 +197,22 @@ pixel_y = s1_gt[5]
 xmax = xmin + s1_cols * pixel_x
 ymin = ymax + s1_rows * pixel_y
 s1_bounds = [xmin, ymin, xmax, ymax]
-s1_ds=None
+s1_ds = None
 date_dict = defaultdict(list)
 products = sorted(glob.glob(os.path.join(workspace, "S2*_MSIL2A_*")))
 
 for product in products:
-    name=os.path.basename(product)
-    m=re.search(r"MSIL2A_(\d{8})T", name)
+    name = os.path.basename(product)
+    m = re.search(r"MSIL2A_(\d{8})T", name)
     if m is None:
         continue
-    date=m.group(1)
-    tifs=glob.glob(os.path.join(product, "**", "*.tif"), recursive=True)
+    date = m.group(1)
+    tifs = glob.glob(os.path.join(product, "**", "*.tif"), recursive=True)
     date_dict[date].extend(tifs)
 
 for date in sorted(date_dict.keys()):
-    tif_list=date_dict[date]
-    outfile=os.path.join(mosaic_dir, f"S2_{date}_S1grid.tif")
+    tif_list = date_dict[date]
+    outfile = os.path.join(mosaic_dir, f"S2_{date}_S1grid.tif")
     if os.path.exists(outfile):
         print("exist skip")
         continue
@@ -226,52 +220,47 @@ for date in sorted(date_dict.keys()):
     gdal.Warp(
         outfile,
         tif_list,
-        # Sentinel-1 CRS
         dstSRS=s1_proj,
-        # Sentinel-1 extent
         outputBounds=s1_bounds,
-        # Sentinel-1 resolution
         xRes=abs(pixel_x),
         yRes=abs(pixel_y),
-        # 分类数据必须nearest
-        resampleAlg=
-        gdal.GRA_NearestNeighbour,
+        # Preserve the categorical SCL values.
+        resampleAlg=gdal.GRA_NearestNeighbour,
         dstNodata=0,
         multithread=True,
         creationOptions=[
             "COMPRESS=LZW",
             "TILED=YES",
-            "BIGTIFF=IF_SAFER"
-        ]
+            "BIGTIFF=IF_SAFER",
+        ],
     )
 
-daily_files=sorted(glob.glob(os.path.join(mosaic_dir,"*.tif")))
-snow_count=np.zeros((s1_rows,s1_cols),dtype=np.uint16)
-valid_count=np.zeros((s1_rows,s1_cols),dtype=np.uint16)
+daily_files = sorted(glob.glob(os.path.join(mosaic_dir, "*.tif")))
+snow_count = np.zeros((s1_rows, s1_cols), dtype=np.uint16)
+valid_count = np.zeros((s1_rows, s1_cols), dtype=np.uint16)
 
-for i,tif in enumerate(daily_files):
-    ds=gdal.Open(tif)
-    arr=(ds.GetRasterBand(1).ReadAsArray())
-    nodata=(ds.GetRasterBand(1).GetNoDataValue())
+for tif in daily_files:
+    ds = gdal.Open(tif)
+    arr = ds.GetRasterBand(1).ReadAsArray()
+    nodata = ds.GetRasterBand(1).GetNoDataValue()
 
     if nodata is not None:
-        valid=arr!=nodata
+        valid = arr != nodata
     else:
-        valid=arr!=0
+        valid = arr != 0
 
-    snow=((arr==11)&valid)
+    snow = (arr == 11) & valid
     snow_count += snow.astype(np.uint16)
     valid_count += valid.astype(np.uint16)
-    ds=None
+    ds = None
 
-snow_mask=np.full((s1_rows,s1_cols),-9999,dtype=np.float32)
-idx=valid_count>0
+snow_mask = np.full((s1_rows, s1_cols), -9999, dtype=np.float32)
+idx = valid_count > 0
+snow_mask[idx] = (snow_count[idx] > 0).astype(np.float32)
 
-snow_mask[idx]=(snow_count[idx]>0).astype(np.float32)
+driver = gdal.GetDriverByName("GTiff")
 
-driver=gdal.GetDriverByName("GTiff")
-
-out_ds=driver.Create(
+out_ds = driver.Create(
     snow_out,
     s1_cols,
     s1_rows,
@@ -280,24 +269,19 @@ out_ds=driver.Create(
     options=[
         "COMPRESS=LZW",
         "TILED=YES",
-        "BIGTIFF=IF_SAFER"
-    ]
+        "BIGTIFF=IF_SAFER",
+    ],
 )
 out_ds.SetGeoTransform(s1_gt)
 out_ds.SetProjection(s1_proj)
-band=out_ds.GetRasterBand(1)
+band = out_ds.GetRasterBand(1)
 band.WriteArray(snow_mask)
 band.SetNoDataValue(-9999)
 band.FlushCache()
-out_ds=None
+out_ds = None
 
 cleanup_intermediate_files()
 
-
 print("\nFinished:")
 print(snow_out)
-
-
-
-
 
