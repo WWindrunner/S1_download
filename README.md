@@ -25,8 +25,10 @@ For each Sentinel-1 product name, the workflow runs the following steps:
      Sentinel-1 acquisition.
    - Uses the Sentinel-2 Scene Classification Layer (SCL) to calculate snow
      occurrence on the Sentinel-1 grid.
-   - Removes downloaded ZIP files, DEM tiles, and SNAP/intermediate rasters
-     after successful completion.
+
+After all four stages succeed, `execute.sh` removes downloaded ZIP files, DEM
+tiles, and SNAP/intermediate rasters. If a stage fails, its intermediate files
+are retained for inspection or retry.
 
 ## Environment
 

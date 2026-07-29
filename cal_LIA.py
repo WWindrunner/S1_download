@@ -1,6 +1,5 @@
 import glob
 import os
-import shutil
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -152,9 +151,6 @@ gdal.Warp(
 
 # print("DEM mosaic completed.")
 
-if os.path.exists(dem_dir):
-    shutil.rmtree(dem_dir)
-
 with rasterio.open(S1_angle_path) as s1_src:
     s1_masked = s1_src.read(1, masked=True).astype(np.float32)
     s1 = s1_masked.filled(np.nan)
@@ -194,8 +190,6 @@ profile.update(
 
 with rasterio.open(dem_merge_resample, "w", **profile) as dst:
     dst.write(dem_reproj.astype(np.float32), 1)
-
-os.remove(dem_merge)
 
 dem_resample_path = os.path.join(path, f"DEM_merged_res.tif")
 LIA_path = os.path.join(path, f"{S1name}_LIA.tif")
@@ -270,5 +264,3 @@ with rasterio.open(
 
 elapsed = time.perf_counter() - start_time
 print(f"Local incidence angle completed in {elapsed:.2f} seconds.")
-
-os.remove(dem_resample_path)

@@ -59,15 +59,55 @@ mapfile -t s1names <<< "$search_output"
 echo "Found ${#s1names[@]} Sentinel-1 images."
 printf '  %s\n' "${s1names[@]}"
 
+cleanup_product_intermediates() {
+    local product_dir="$path/$1"
+
+    if [ ! -d "$product_dir" ]; then
+        echo "Cleanup skipped: product directory not found: $product_dir"
+        return
+    fi
+
+    rm -rf -- \
+        "$product_dir/snow_temp" \
+        "$product_dir/dem_tiles"
+    rm -f -- \
+        "$product_dir"/*.zip \
+        "$product_dir"/*incidenceAngleFromEllipsoid.tif \
+        "$product_dir"/*localIncidenceAngle.tif \
+        "$product_dir"/*_manifest.safe \
+        "$product_dir"/*_proc.xml \
+        "$product_dir"/*_gamma0-elp.tif \
+        "$product_dir"/DEM_merged.tif \
+        "$product_dir"/DEM_merged_res.tif
+}
+
 for s1name in "${s1names[@]}"; do
     echo "Processing $s1name"
 
-    python Sentinel_1_specific_name_download_process.py \
+    if ! python Sentinel_1_specific_name_download_process.py \
         "$s1name" \
         "$path" \
         "$username" \
-        "$password"
-    python Desert_mask.py "$s1name" "$path" "$desert_mask_vrt"
-    python cal_LIA.py "$s1name" "$path"
-    python Snow_detect.py "$s1name" "$path"
+        "$password"; then
+        echo "Sentinel-1 processing failed for $s1name; intermediates retained."
+        continue
+    fi
+
+    if ! python Desert_mask.py "$s1name" "$path" "$desert_mask_vrt"; then
+        echo "Desert-mask processing failed for $s1name; intermediates retained."
+        continue
+    fi
+
+    if ! python cal_LIA.py "$s1name" "$path"; then
+        echo "LIA processing failed for $s1name; intermediates retained."
+        continue
+    fi
+
+    if ! python Snow_detect.py "$s1name" "$path"; then
+        echo "Snow processing failed for $s1name; intermediates retained."
+        continue
+    fi
+
+    cleanup_product_intermediates "$s1name"
+    echo "Completed and cleaned intermediate files for $s1name."
 done

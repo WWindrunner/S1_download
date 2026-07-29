@@ -41,30 +41,6 @@ os.makedirs(workspace, exist_ok=True)
 snow_out = os.path.join(safe_dir, f"{S1name}_ice.tif")
 
 
-def cleanup_intermediate_files():
-    if os.path.isdir(workspace):
-        shutil.rmtree(workspace)
-
-    cleanup_patterns = [
-        "*.zip",
-        "*incidenceAngleFromEllipsoid.tif",
-        "*localIncidenceAngle.tif",
-        "*_manifest.safe",
-        "*_proc.xml",
-        "*_gamma0-elp.tif",
-    ]
-
-    for pattern in cleanup_patterns:
-        for file_path in glob.glob(os.path.join(safe_dir, pattern)):
-            os.remove(file_path)
-            # print(f"Removed intermediate file: {file_path}")
-
-    dem_tiles = os.path.join(safe_dir, "dem_tiles")
-    if os.path.isdir(dem_tiles):
-        shutil.rmtree(dem_tiles)
-        # print(f"Removed intermediate directory: {dem_tiles}")
-
-
 def download_scl_asset(scl_href, scl_file):
     """Download one Planetary Computer asset without EODAG's auth headers."""
     signed_href = planetary_computer.sign_url(scl_href)
@@ -134,7 +110,6 @@ if not search_results:
         "area. Creating a nodata ice raster."
     )
     create_nodata_ice_raster()
-    cleanup_intermediate_files()
     elapsed = time.perf_counter() - start_time
     print(f"Empty snow mask completed in {elapsed:.2f} seconds.")
     sys.exit(0)
@@ -280,8 +255,6 @@ band.WriteArray(snow_mask)
 band.SetNoDataValue(-9999)
 band.FlushCache()
 out_ds = None
-
-cleanup_intermediate_files()
 
 elapsed = time.perf_counter() - start_time
 print(f"Snow mask completed in {elapsed:.2f} seconds.")
