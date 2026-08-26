@@ -451,15 +451,21 @@ area_thresholds = 1000
 # Main program
 
 # path set up
-flood_waring_directory = workfolder + "ESA_flood_waring/"
+flood_waring_directory = os.path.join(workfolder, "ESA_flood_waring")
 os.makedirs(flood_waring_directory, exist_ok=True) 
-Sentinel_process_dir = workfolder + "Sentinel_1/"
+Sentinel_process_dir = os.path.join(workfolder, "Sentinel_1")
 os.makedirs(Sentinel_process_dir, exist_ok=True) 
 processed_images_dir = os.path.join(Sentinel_process_dir, "processed_images")
 os.makedirs(processed_images_dir, exist_ok=True)
 glofas_date_name = datetime.datetime(year, month, day).strftime("%Y%m%d")
-shapefile = flood_waring_directory + "FloodMaskMerged" + f"{glofas_date_name}00.shp"
-Processed_Sentinel_1_data_path_filename = workfolder + f"Processed_Sentinel_1_data_path_{glofas_date_name}.txt"
+shapefile = os.path.join(
+    flood_waring_directory,
+    f"FloodMaskMerged{glofas_date_name}00.shp",
+)
+Processed_Sentinel_1_data_path_filename = os.path.join(
+    workfolder,
+    f"Processed_Sentinel_1_data_path_{glofas_date_name}.txt",
+)
 if os.path.exists(Processed_Sentinel_1_data_path_filename):
     os.remove(Processed_Sentinel_1_data_path_filename)
 
@@ -501,7 +507,7 @@ else:
             print(f"Error processing {name}: {e}")
             continue
     with open(Processed_Sentinel_1_data_path_filename, "a", encoding="utf-8") as f:
-        f.write(Sentinel_process_dir + "processed_images/\n")
+        f.write(processed_images_dir + os.sep + "\n")
         
 total_time = datetime.datetime.now()
 print(f"\n{year}-{str(month).zfill(2)}-{str(day).zfill(2)} triger finished in " +str(total_time - now))
