@@ -1,20 +1,110 @@
+import argparse
 import glob
 import os
-import sys
+import shutil
 import time
 import xml.etree.ElementTree as ET
+import zipfile
 
 import numpy as np
 import planetary_computer as pc
 import rasterio
 import requests
 from osgeo import gdal
-from pyroSAR import identify
 from pystac_client import Client
-from rasterio.warp import reproject, Resampling
+from rasterio.warp import reproject, Resampling, transform_bounds
 
 start_time = time.perf_counter()
-OUTPUT_NODATA = -9999.0
+MASK_NODATA = 255
+LIA_THRESHOLD_DEGREES = 50.0
+
+
+def normalize_orbit_direction(value):
+    if value is None:
+        return None
+    value = str(value).strip().upper()
+    aliases = {"A": "ASCENDING", "D": "DESCENDING"}
+    value = aliases.get(value, value)
+    if value not in {"ASCENDING", "DESCENDING"}:
+        return None
+    return value
+
+
+def direction_from_xml(xml_content):
+    root = ET.fromstring(xml_content)
+    for elem in root.iter():
+        if elem.tag.endswith("pass"):
+            direction = normalize_orbit_direction(elem.text)
+            if direction:
+                return direction
+    return None
+
+
+def direction_from_local_metadata(scene_dir):
+    manifests = sorted(glob.glob(os.path.join(scene_dir, "*manifest.safe")))
+    for manifest in manifests:
+        with open(manifest, "rb") as source:
+            direction = direction_from_xml(source.read())
+        if direction:
+            print(f"Orbit direction read from manifest: {direction}")
+            return direction
+
+    for archive_path in sorted(glob.glob(os.path.join(scene_dir, "*.zip"))):
+        try:
+            with zipfile.ZipFile(archive_path) as archive:
+                manifest_names = [
+                    name for name in archive.namelist()
+                    if name.lower().endswith("manifest.safe")
+                ]
+                for name in manifest_names:
+                    direction = direction_from_xml(archive.read(name))
+                    if direction:
+                        print(f"Orbit direction read from ZIP: {direction}")
+                        return direction
+        except (OSError, zipfile.BadZipFile, ET.ParseError) as exc:
+            print(f"Could not read orbit direction from {archive_path}: {exc}")
+    return None
+
+
+def direction_from_catalog(product_name):
+    safe_name = product_name if product_name.endswith(".SAFE") else f"{product_name}.SAFE"
+    escaped_name = safe_name.replace("'", "''")
+    url = (
+        "https://catalogue.dataspace.copernicus.eu/odata/v1/Products"
+        f"?$filter=Name eq '{escaped_name}'&$expand=Attributes"
+    )
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    products = response.json().get("value", [])
+    for product in products:
+        for attribute in product.get("Attributes", []):
+            if str(attribute.get("Name", "")).lower() == "orbitdirection":
+                direction = normalize_orbit_direction(attribute.get("Value"))
+                if direction:
+                    print(f"Orbit direction read from Copernicus catalogue: {direction}")
+                    return direction
+    return None
+
+
+def resolve_orbit_direction(product_name, scene_dir, user_direction=None):
+    direction = direction_from_local_metadata(scene_dir)
+    if direction:
+        return direction
+    try:
+        direction = direction_from_catalog(product_name)
+    except (requests.RequestException, ValueError) as exc:
+        print(f"Copernicus orbit-direction lookup failed: {exc}")
+        direction = None
+    if direction:
+        return direction
+    direction = normalize_orbit_direction(user_direction)
+    if direction:
+        print(f"Using user-provided orbit direction: {direction}")
+        return direction
+    raise ValueError(
+        "Orbit direction is required for LIA. Provide manifest.safe, the "
+        "original ZIP, catalogue access, or --orbit-direction ASCENDING/DESCENDING."
+    )
 
 
 def pixel_spacing_meters(transform, crs, rows):
@@ -61,42 +151,65 @@ def pixel_spacing_meters(transform, crs, rows):
 
     return x_spacing, y_spacing
 
-if len(sys.argv) != 3:
-    print(
-        "Usage: python cal_LIA.py "
-        "<S1_PRODUCT_NAME> <OUTPUT_FOLDER>"
+parser = argparse.ArgumentParser(
+    description="Generate a binary LIA > 50 degree exclusion mask."
+)
+parser.add_argument("s1_product_name")
+parser.add_argument("work_dir", help="Writable per-scene preprocessing directory.")
+parser.add_argument(
+    "--incidence-angle",
+    help=(
+        "Read-only ellipsoid incidence-angle raster. If omitted, use the "
+        "legacy layout <WORK_DIR>/<S1_PRODUCT_NAME>/ and discover it there."
+    ),
+)
+parser.add_argument(
+    "--metadata-dir",
+    help="Read-only directory that may contain manifest.safe or the S1 ZIP.",
+)
+parser.add_argument(
+    "--orbit-direction", choices=["ASCENDING", "DESCENDING", "A", "D"],
+    help="Fallback when orbit direction cannot be read or queried.",
+)
+cli_args = parser.parse_args()
+
+S1name = cli_args.s1_product_name
+path = os.path.abspath(os.path.expanduser(cli_args.work_dir))
+legacy_cli = cli_args.incidence_angle is None
+if legacy_cli:
+    path = os.path.join(path, S1name)
+    incidence_candidates = sorted(
+        glob.glob(os.path.join(path, "*incidenceAngleFromEllipsoid.tif"))
     )
-    sys.exit(1)
+    if len(incidence_candidates) != 1:
+        raise FileNotFoundError(
+            "Legacy invocation expected exactly one ellipsoid incidence-angle "
+            f"raster in {path}, found {len(incidence_candidates)}"
+        )
+    cli_args.incidence_angle = incidence_candidates[0]
+metadata_dir = (
+    os.path.abspath(os.path.expanduser(cli_args.metadata_dir))
+    if cli_args.metadata_dir else path
+)
+os.makedirs(path, exist_ok=True)
 
-S1name = sys.argv[1]
-folder = os.path.abspath(os.path.expanduser(sys.argv[2]))
-path = os.path.join(folder, S1name)
-
-# print(f"Path: {path}")
-
-if not os.path.isdir(path):
-    raise FileNotFoundError(f"S1 product folder not found: {path}")
-
-zip_path = glob.glob(os.path.join(path, "*.zip"))[0]
-# print(zip_path)
-scene = identify(zip_path)
-
-S1_angle_path = glob.glob(os.path.join(path, f"*incidenceAngleFromEllipsoid.tif"))[0]
+S1_angle_path = os.path.abspath(os.path.expanduser(cli_args.incidence_angle))
+if not os.path.isfile(S1_angle_path):
+    raise FileNotFoundError(
+        f"Ellipsoid incidence-angle raster not found: {S1_angle_path}"
+    )
 dem_dir = os.path.join(path, "dem_tiles")
 os.makedirs(dem_dir, exist_ok=True)
-
-SAFE_file = glob.glob(os.path.join(path, f"*_manifest.safe"))[0]
 
 dem_merge = os.path.join(path, f"DEM_merged.tif")
 dem_merge_resample = os.path.join(path, f"DEM_merged_res.tif")
 
-bbox = scene.bbox()
-bbox = [
-    bbox.extent["xmin"],
-    bbox.extent["ymin"],
-    bbox.extent["xmax"],
-    bbox.extent["ymax"],
-]
+with rasterio.open(S1_angle_path) as angle_source:
+    if angle_source.crs is None:
+        raise ValueError(f"Incidence-angle raster has no CRS: {S1_angle_path}")
+    bbox = transform_bounds(
+        angle_source.crs, "EPSG:4326", *angle_source.bounds, densify_pts=21
+    )
 
 # Search for Copernicus DEM tiles covering the Sentinel-1 scene.
 catalog = Client.open(
@@ -184,6 +297,8 @@ profile.update(
     count=1,
     compress="lzw",
     tiled=True,
+    blockxsize=256,
+    blockysize=256,
     BIGTIFF="YES",
     nodata=np.nan,
 )
@@ -218,15 +333,9 @@ aspect = aspect % 360
 inc = s1
 inc_rad = np.deg2rad(inc)
 
-tree = ET.parse(SAFE_file)
-root = tree.getroot()
-
-# Read the orbit direction without depending on the XML namespace.
-for elem in root.iter():
-    if elem.tag.endswith("pass"):
-        # print(elem.text)
-        pass_dir = elem.text
-
+pass_dir = resolve_orbit_direction(
+    S1name, metadata_dir, cli_args.orbit_direction
+)
 AZIMUTH = 282 if pass_dir == "ASCENDING" else 102
 azi_rad = np.deg2rad(AZIMUTH)
 
@@ -243,7 +352,8 @@ cos_lia = np.clip(cos_lia, -1, 1)
 
 lia = np.degrees(np.arccos(cos_lia))
 valid = np.isfinite(dem) & np.isfinite(inc) & np.isfinite(lia)
-lia = np.where(valid, lia, OUTPUT_NODATA)
+lia_mask = np.full(lia.shape, MASK_NODATA, dtype=np.uint8)
+lia_mask[valid] = (lia[valid] > LIA_THRESHOLD_DEGREES).astype(np.uint8)
 
 with rasterio.open(
     LIA_path,
@@ -252,15 +362,29 @@ with rasterio.open(
     height=lia.shape[0],
     width=lia.shape[1],
     count=1,
-    dtype="float32",
+    dtype="uint8",
     crs=output_crs,
     transform=transform,
-    nodata=OUTPUT_NODATA,
-    compress="lzw",
+    nodata=MASK_NODATA,
+    compress="deflate",
     tiled=True,
+    blockxsize=256,
+    blockysize=256,
     BIGTIFF="IF_SAFER",
 ) as dst:
-    dst.write(lia.astype(np.float32), 1)
+    dst.write(lia_mask, 1)
+    dst.set_band_description(1, "local_incidence_angle_greater_than_50_degrees")
+    dst.update_tags(
+        mask_semantics="0=keep,1=exclude,255=nodata",
+        lia_threshold_degrees=LIA_THRESHOLD_DEGREES,
+        orbit_direction=pass_dir,
+        radar_azimuth_degrees=AZIMUTH,
+    )
+
+shutil.rmtree(dem_dir)
+for temporary_path in (dem_merge, dem_merge_resample):
+    if os.path.isfile(temporary_path):
+        os.remove(temporary_path)
 
 elapsed = time.perf_counter() - start_time
 print(f"Local incidence angle completed in {elapsed:.2f} seconds.")

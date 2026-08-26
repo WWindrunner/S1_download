@@ -1,261 +1,197 @@
+"""Generate snow and persistent-cloud masks from Sentinel-2 SCL data."""
+
+import argparse
 from collections import defaultdict
 from datetime import datetime, timedelta
-import glob
 import os
 import re
 import shutil
 import sys
 import time
-import traceback
 import urllib.request
 
 import numpy as np
 import planetary_computer
+import rasterio
 from eodag import EODataAccessGateway, setup_logging
 from osgeo import gdal
-from pyroSAR import identify
+from rasterio.warp import transform_bounds
 
 gdal.UseExceptions()
-start_time = time.perf_counter()
 
-if len(sys.argv) != 3:
-    print(
-        "Usage: python Snow_detect.py "
-        "<S1_PRODUCT_NAME> <OUTPUT_FOLDER>"
-    )
-    sys.exit(1)
-
-S1name = sys.argv[1]
-folder = os.path.abspath(os.path.expanduser(sys.argv[2]))
-safe_dir = os.path.join(folder, S1name)
-
-# print(f"Path: {safe_dir}")
-
-if not os.path.isdir(safe_dir):
-    raise FileNotFoundError(f"S1 product folder not found: {safe_dir}")
-
-tifs = glob.glob(os.path.join(safe_dir, "*VV.tif"))
-s1_file = tifs[0]
-workspace = os.path.join(safe_dir, "snow_temp")
-os.makedirs(workspace, exist_ok=True)
-snow_out = os.path.join(safe_dir, f"{S1name}_ice.tif")
+MASK_NODATA = 255
+CLOUD_CLASSES = (3, 8, 9, 10)
+S1_TIME_PATTERN = re.compile(r"_([0-9]{8}T[0-9]{6})_")
+S2_DATE_PATTERN = re.compile(r"MSIL2A?_([0-9]{8})T")
 
 
-def download_scl_asset(scl_href, scl_file):
-    """Download one Planetary Computer asset without EODAG's auth headers."""
-    signed_href = planetary_computer.sign_url(scl_href)
-    os.makedirs(os.path.dirname(scl_file), exist_ok=True)
-    partial_file = f"{scl_file}.part"
+def parse_s1_time(product_name):
+    match = S1_TIME_PATTERN.search(product_name)
+    if match is None:
+        raise ValueError(f"Cannot parse acquisition time from S1 name: {product_name}")
+    return datetime.strptime(match.group(1), "%Y%m%dT%H%M%S")
+
+
+def download_scl_asset(href, destination):
+    signed_href = planetary_computer.sign_url(href)
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    partial = f"{destination}.part"
     try:
         with urllib.request.urlopen(signed_href, timeout=300) as response:
-            with open(partial_file, "wb") as output:
+            with open(partial, "wb") as output:
                 shutil.copyfileobj(response, output)
-        os.replace(partial_file, scl_file)
+        os.replace(partial, destination)
     finally:
-        if os.path.exists(partial_file):
-            os.remove(partial_file)
-
-    return scl_file
+        if os.path.exists(partial):
+            os.remove(partial)
 
 
-def create_nodata_ice_raster():
-    s1_ds = gdal.Open(s1_file)
-    driver = gdal.GetDriverByName("GTiff")
-    out_ds = driver.Create(
-        snow_out,
-        s1_ds.RasterXSize,
-        s1_ds.RasterYSize,
-        1,
-        gdal.GDT_Float32,
-        options=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"]
+def write_mask(path, data, profile, description):
+    output_profile = profile.copy()
+    output_profile.update(
+        driver="GTiff", count=1, dtype="uint8", nodata=MASK_NODATA,
+        compress="deflate", tiled=True, blockxsize=256, blockysize=256,
+        BIGTIFF="IF_SAFER",
     )
-    out_ds.SetGeoTransform(s1_ds.GetGeoTransform())
-    out_ds.SetProjection(s1_ds.GetProjection())
-    band = out_ds.GetRasterBand(1)
-    band.SetNoDataValue(-9999)
-    band.Fill(-9999)
-    band.FlushCache()
-    out_ds = None
-    s1_ds = None
+    with rasterio.open(path, "w", **output_profile) as dst:
+        dst.write(data.astype(np.uint8), 1)
+        dst.set_band_description(1, description)
 
 
-zip_path = glob.glob(os.path.join(safe_dir, "*.zip"))[0]
-scene = identify(zip_path)
-os.environ["EODAG__PLANETARY_COMPUTER__DOWNLOAD__OUTPUT_DIR"] = os.path.abspath(workspace)
-dag = EODataAccessGateway()
-setup_logging(0)
-end_dt = datetime.fromisoformat(scene.start)
-start_dt = end_dt - timedelta(days=15)
-end = end_dt.strftime("%Y-%m-%d")
-start = start_dt.strftime("%Y-%m-%d")
-bbox = scene.bbox()
-geom = {
-    "lonmin": bbox.extent['xmin'],
-    "latmin": bbox.extent['ymin'],
-    "lonmax": bbox.extent['xmax'],
-    "latmax": bbox.extent['ymax'],
-}
-search_results = dag.search_all(
-    provider="planetary_computer",
-    collection="S2_MSI_L2A",
-    start=start,
-    end=end,
-    geom=geom
-)
-n = len(search_results)
-print(f"Sentinel-2 search completed: {n} products found.")
-if not search_results:
-    print(
-        "WARNING: No Sentinel-2 products found for the search period and "
-        "area. Creating a nodata ice raster."
-    )
-    create_nodata_ice_raster()
-    elapsed = time.perf_counter() - start_time
-    print(f"Empty snow mask completed in {elapsed:.2f} seconds.")
-    sys.exit(0)
+def generate_s2_masks(product_name, reference_path, output_dir):
+    started = time.perf_counter()
+    reference_path = os.path.abspath(os.path.expanduser(reference_path))
+    output_dir = os.path.abspath(os.path.expanduser(output_dir))
+    if not os.path.isfile(reference_path):
+        raise FileNotFoundError(f"Gamma0 reference not found: {reference_path}")
+    os.makedirs(output_dir, exist_ok=True)
+    workspace = os.path.join(output_dir, "snow_temp")
+    os.makedirs(workspace, exist_ok=True)
+    snow_out = os.path.join(output_dir, f"{product_name}_ice.tif")
+    cloud_out = os.path.join(output_dir, f"{product_name}_cloud.tif")
 
-for product in search_results:
-    product_name = product.properties.get(
-        "title",
-        product.properties.get("id", "unknown_product")
-    )
-    scl_file = os.path.join(
-        workspace,
-        product_name,
-        "SCL_20m.tif"
-    )
-    # print(scl_file)
-    if os.path.exists(scl_file):
-        # print(f"Already exists, skip: {product_name}")
-        continue
-
-    scl_asset = product.assets.get("SCL_20m")
-    if scl_asset is None:
-        # print(f"Download skipped for {product_name}: SCL_20m asset is missing")
-        # print(f"Available assets: {list(product.assets.keys())}")
-        continue
-
-    scl_href = scl_asset.get("href")
-    if not isinstance(scl_href, str) or not scl_href:
-        print(
-            f"Download skipped for {product_name}: "
-            f"SCL_20m has an invalid href: {scl_href!r}"
+    with rasterio.open(reference_path) as reference:
+        if reference.crs is None:
+            raise ValueError(f"Reference raster has no CRS: {reference_path}")
+        profile = reference.profile.copy()
+        rows, cols = reference.height, reference.width
+        bounds_wgs84 = transform_bounds(
+            reference.crs, "EPSG:4326", *reference.bounds, densify_pts=21
         )
-        continue
+        reference_projection = reference.crs.to_wkt()
+        reference_bounds = tuple(reference.bounds)
 
-    product_start_time = time.perf_counter()
-    try:
-        downloaded_path = download_scl_asset(scl_href, scl_file)
-        elapsed = time.perf_counter() - product_start_time
-        # print(f"Downloaded: {downloaded_path}")
-        # print(f"Download time: {elapsed:.2f} seconds")
-    except Exception as e:
-        elapsed = time.perf_counter() - product_start_time
-        print(
-            f"Download failed for {product_name} after {elapsed:.2f} seconds: "
-            f"{type(e).__name__}: {e}"
-        )
-        # traceback.print_exc()
-        time.sleep(10)
-        continue
-
-mosaic_dir = os.path.join(workspace, "Daily_Mosaic_S1grid")
-os.makedirs(mosaic_dir, exist_ok=True)
-s1_ds = gdal.Open(s1_file)
-s1_proj = s1_ds.GetProjection()
-s1_gt = s1_ds.GetGeoTransform()
-s1_cols = s1_ds.RasterXSize
-s1_rows = s1_ds.RasterYSize
-xmin = s1_gt[0]
-ymax = s1_gt[3]
-pixel_x = s1_gt[1]
-pixel_y = s1_gt[5]
-xmax = xmin + s1_cols * pixel_x
-ymin = ymax + s1_rows * pixel_y
-s1_bounds = [xmin, ymin, xmax, ymax]
-s1_ds = None
-date_dict = defaultdict(list)
-products = sorted(glob.glob(os.path.join(workspace, "S2*_MSIL2A_*")))
-
-for product in products:
-    name = os.path.basename(product)
-    m = re.search(r"MSIL2A_(\d{8})T", name)
-    if m is None:
-        continue
-    date = m.group(1)
-    tifs = glob.glob(os.path.join(product, "**", "*.tif"), recursive=True)
-    date_dict[date].extend(tifs)
-
-for date in sorted(date_dict.keys()):
-    tif_list = date_dict[date]
-    outfile = os.path.join(mosaic_dir, f"S2_{date}_S1grid.tif")
-    if os.path.exists(outfile):
-        # print("Daily mosaic already exists.")
-        continue
-
-    gdal.Warp(
-        outfile,
-        tif_list,
-        dstSRS=s1_proj,
-        outputBounds=s1_bounds,
-        xRes=abs(pixel_x),
-        yRes=abs(pixel_y),
-        # Preserve the categorical SCL values.
-        resampleAlg=gdal.GRA_NearestNeighbour,
-        dstNodata=0,
-        multithread=True,
-        creationOptions=[
-            "COMPRESS=LZW",
-            "TILED=YES",
-            "BIGTIFF=IF_SAFER",
-        ],
+    end_dt = parse_s1_time(product_name)
+    start_dt = end_dt - timedelta(days=15)
+    geom = {
+        "lonmin": bounds_wgs84[0], "latmin": bounds_wgs84[1],
+        "lonmax": bounds_wgs84[2], "latmax": bounds_wgs84[3],
+    }
+    os.environ["EODAG__PLANETARY_COMPUTER__DOWNLOAD__OUTPUT_DIR"] = workspace
+    setup_logging(0)
+    results = EODataAccessGateway().search_all(
+        provider="planetary_computer", collection="S2_MSI_L2A",
+        start=start_dt.strftime("%Y-%m-%d"), end=end_dt.strftime("%Y-%m-%d"),
+        geom=geom,
     )
+    print(f"Sentinel-2 search completed: {len(results)} products found.")
 
-daily_files = sorted(glob.glob(os.path.join(mosaic_dir, "*.tif")))
-snow_count = np.zeros((s1_rows, s1_cols), dtype=np.uint16)
-valid_count = np.zeros((s1_rows, s1_cols), dtype=np.uint16)
+    files_by_date = defaultdict(list)
+    for product in results:
+        title = product.properties.get("title", product.properties.get("id", ""))
+        date_match = S2_DATE_PATTERN.search(title)
+        asset = product.assets.get("SCL_20m")
+        href = asset.get("href") if asset is not None else None
+        if date_match is None or not isinstance(href, str) or not href:
+            print(f"Skipping Sentinel-2 product without usable SCL/date: {title}")
+            continue
+        scl_path = os.path.join(workspace, title, "SCL_20m.tif")
+        if not os.path.isfile(scl_path):
+            try:
+                download_scl_asset(href, scl_path)
+            except Exception as exc:
+                print(f"SCL download failed for {title}: {exc}", file=sys.stderr)
+                continue
+        files_by_date[date_match.group(1)].append(scl_path)
 
-for tif in daily_files:
-    ds = gdal.Open(tif)
-    arr = ds.GetRasterBand(1).ReadAsArray()
-    nodata = ds.GetRasterBand(1).GetNoDataValue()
+    snow_any = np.zeros((rows, cols), dtype=bool)
+    valid_day_count = np.zeros((rows, cols), dtype=np.uint16)
+    cloud_day_count = np.zeros((rows, cols), dtype=np.uint16)
 
-    if nodata is not None:
-        valid = arr != nodata
+    for date, scl_paths in sorted(files_by_date.items()):
+        daily_snow = np.zeros((rows, cols), dtype=bool)
+        daily_valid = np.zeros((rows, cols), dtype=bool)
+        daily_noncloud = np.zeros((rows, cols), dtype=bool)
+        for index, scl_path in enumerate(scl_paths):
+            aligned_path = os.path.join(workspace, f"aligned_{date}_{index}.tif")
+            aligned = gdal.Warp(
+                aligned_path, scl_path, dstSRS=reference_projection,
+                outputBounds=reference_bounds, width=cols, height=rows,
+                resampleAlg=gdal.GRA_NearestNeighbour, srcNodata=0, dstNodata=0,
+                multithread=True,
+                creationOptions=["TILED=YES", "COMPRESS=DEFLATE"],
+            )
+            if aligned is None:
+                print(f"Failed to align SCL raster: {scl_path}", file=sys.stderr)
+                continue
+            aligned = None
+            with rasterio.open(aligned_path) as src:
+                arr = src.read(1)
+            os.remove(aligned_path)
+            valid = arr != 0
+            cloud = valid & np.isin(arr, CLOUD_CLASSES)
+            daily_snow |= valid & (arr == 11)
+            daily_valid |= valid
+            daily_noncloud |= valid & ~cloud
+
+        daily_cloud = daily_valid & ~daily_noncloud
+        snow_any |= daily_snow
+        valid_day_count += daily_valid.astype(np.uint16)
+        cloud_day_count += daily_cloud.astype(np.uint16)
+
+    observed = valid_day_count > 0
+    snow_mask = np.full((rows, cols), MASK_NODATA, dtype=np.uint8)
+    cloud_mask = np.full((rows, cols), MASK_NODATA, dtype=np.uint8)
+    snow_mask[observed] = snow_any[observed].astype(np.uint8)
+    cloud_mask[observed] = (
+        cloud_day_count[observed] == valid_day_count[observed]
+    ).astype(np.uint8)
+    write_mask(snow_out, snow_mask, profile, "snow_or_ice_seen_in_15_day_window")
+    write_mask(cloud_out, cloud_mask, profile, "cloud_on_all_valid_observation_days")
+    shutil.rmtree(workspace)
+    print(f"Snow mask: {snow_out}")
+    print(f"Cloud mask: {cloud_out}")
+    print(f"Sentinel-2 masks completed in {time.perf_counter() - started:.2f} seconds.")
+    return snow_out, cloud_out
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("s1_product_name")
+    parser.add_argument(
+        "reference_raster",
+        help=(
+            "Gamma0 reference raster, or the legacy output root when "
+            "OUTPUT_DIR is omitted."
+        ),
+    )
+    parser.add_argument("output_dir", nargs="?")
+    args = parser.parse_args()
+    legacy_cli = args.output_dir is None
+    if legacy_cli:
+        output_dir = os.path.join(
+            os.path.abspath(os.path.expanduser(args.reference_raster)),
+            args.s1_product_name,
+        )
+        reference_path = os.path.join(output_dir, "Gamma0_VV.tif")
     else:
-        valid = arr != 0
+        output_dir = args.output_dir
+        reference_path = args.reference_raster
 
-    snow = (arr == 11) & valid
-    snow_count += snow.astype(np.uint16)
-    valid_count += valid.astype(np.uint16)
-    ds = None
+    generate_s2_masks(
+        args.s1_product_name, reference_path, output_dir
+    )
 
-snow_mask = np.full((s1_rows, s1_cols), -9999, dtype=np.float32)
-idx = valid_count > 0
-snow_mask[idx] = (snow_count[idx] > 0).astype(np.float32)
 
-driver = gdal.GetDriverByName("GTiff")
-
-out_ds = driver.Create(
-    snow_out,
-    s1_cols,
-    s1_rows,
-    1,
-    gdal.GDT_Float32,
-    options=[
-        "COMPRESS=LZW",
-        "TILED=YES",
-        "BIGTIFF=IF_SAFER",
-    ],
-)
-out_ds.SetGeoTransform(s1_gt)
-out_ds.SetProjection(s1_proj)
-band = out_ds.GetRasterBand(1)
-band.WriteArray(snow_mask)
-band.SetNoDataValue(-9999)
-band.FlushCache()
-out_ds = None
-
-elapsed = time.perf_counter() - start_time
-print(f"Snow mask completed in {elapsed:.2f} seconds.")
-
+if __name__ == "__main__":
+    main()

@@ -20,11 +20,15 @@ For each Sentinel-1 product name, the workflow runs the following steps:
    - Downloads Copernicus DEM tiles from Microsoft Planetary Computer.
    - Resamples the DEM to the Sentinel-1 grid and calculates local incidence
      angle (LIA).
+   - Writes a uint8 exclusion mask: 0 for LIA up to 50 degrees, 1 for LIA
+     greater than 50 degrees, and 255 for nodata.
 4. `Snow_detect.py`
    - Searches for Sentinel-2 L2A products from the 15 days before the
      Sentinel-1 acquisition.
    - Uses the Sentinel-2 Scene Classification Layer (SCL) to calculate snow
-     occurrence on the Sentinel-1 grid.
+     occurrence and persistent cloud on the Sentinel-1 grid.
+   - Combines overlapping Sentinel-2 tiles by acquisition day before counting
+     valid/cloud observations, avoiding duplicate observations on tile seams.
 
 After all four stages succeed, `execute.sh` removes downloaded ZIP files, DEM
 tiles, and SNAP/intermediate rasters. If a stage fails, its intermediate files
@@ -71,9 +75,22 @@ The four stages can also be run manually:
 python Sentinel_1_specific_name_download_process.py \
   <S1_PRODUCT_NAME> <OUTPUT_FOLDER> <USERNAME> <PASSWORD>
 python Desert_mask.py <S1_PRODUCT_NAME> <OUTPUT_FOLDER> <DESERT_MASK_VRT>
+python cal_LIA.py <S1_PRODUCT_NAME> <PRODUCT_FOLDER> \
+  --incidence-angle <ELLIPSOID_INCIDENCE_ANGLE> \
+  --metadata-dir <PRODUCT_FOLDER>
+python Snow_detect.py \
+  <S1_PRODUCT_NAME> <REFERENCE_GAMMA0> <PRODUCT_FOLDER>
+```
+
+The legacy two-argument forms remain supported:
+
+```bash
 python cal_LIA.py <S1_PRODUCT_NAME> <OUTPUT_FOLDER>
 python Snow_detect.py <S1_PRODUCT_NAME> <OUTPUT_FOLDER>
 ```
+
+They discover inputs under `<OUTPUT_FOLDER>/<S1_PRODUCT_NAME>/`. Both the
+legacy and explicit calling forms use the same scene-prefixed output names.
 
 ## Output structure
 
@@ -87,6 +104,7 @@ Each Sentinel-1 product is written to its own subdirectory:
     +-- <S1_PRODUCT_NAME>_desert.tif
     +-- <S1_PRODUCT_NAME>_LIA.tif
     +-- <S1_PRODUCT_NAME>_ice.tif
+    +-- <S1_PRODUCT_NAME>_cloud.tif
 ```
 
 Intermediate SNAP output files are removed after successful completion.

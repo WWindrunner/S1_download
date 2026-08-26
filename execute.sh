@@ -4,6 +4,7 @@
 #SBATCH --mem=30G
 #SBATCH --output=/tank/data/SFS/xinyis/FS650/maopuxu/lab_2/src/download_and_process_%j.out
 
+shopt -s nullglob
 
 source /tank/data/SFS/xinyis/zhao89/software/conda/bin/activate
 conda activate s1pro
@@ -83,6 +84,7 @@ cleanup_product_intermediates() {
 
 for s1name in "${s1names[@]}"; do
     echo "Processing $s1name"
+    product_dir="$path/$s1name"
 
     if ! python Sentinel_1_specific_name_download_process.py \
         "$s1name" \
@@ -98,13 +100,26 @@ for s1name in "${s1names[@]}"; do
         continue
     fi
 
-    if ! python cal_LIA.py "$s1name" "$path"; then
+    incidence_angles=("$product_dir"/*incidenceAngleFromEllipsoid.tif)
+    if [ "${#incidence_angles[@]}" -ne 1 ]; then
+        echo "Expected exactly one incidence-angle raster for $s1name; found ${#incidence_angles[@]}."
+        continue
+    fi
+
+    if ! python cal_LIA.py \
+        "$s1name" \
+        "$product_dir" \
+        --incidence-angle "${incidence_angles[0]}" \
+        --metadata-dir "$product_dir"; then
         echo "LIA processing failed for $s1name; intermediates retained."
         continue
     fi
 
-    if ! python Snow_detect.py "$s1name" "$path"; then
-        echo "Snow processing failed for $s1name; intermediates retained."
+    if ! python Snow_detect.py \
+        "$s1name" \
+        "$product_dir/Gamma0_VV.tif" \
+        "$product_dir"; then
+        echo "Snow/cloud processing failed for $s1name; intermediates retained."
         continue
     fi
 
