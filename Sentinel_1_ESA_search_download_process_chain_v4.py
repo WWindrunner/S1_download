@@ -495,10 +495,6 @@ else:
         name = row["Name"]
         try:
             start_time_each_image = datetime.datetime.now()
-            if name.startswith("S1C"):
-                print("Can not process S1C right now")
-                continue
-
             run_new_processing_chain(name, processed_images_dir, desert_mask_vrt)
             interval_time = datetime.datetime.now()
             print(f"Finished in {interval_time - start_time_each_image}")
