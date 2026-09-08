@@ -61,6 +61,7 @@ echo "Found ${#s1names[@]} Sentinel-1 images."
 printf '  %s\n' "${s1names[@]}"
 
 cleanup_product_intermediates() {
+    # Keep *_DEM.tif exported by SNAP for LIA reuse and inspection.
     local product_dir="$path/$1"
 
     if [ ! -d "$product_dir" ]; then
@@ -77,7 +78,7 @@ cleanup_product_intermediates() {
         "$product_dir"/*localIncidenceAngle.tif \
         "$product_dir"/*_manifest.safe \
         "$product_dir"/*_proc.xml \
-        "$product_dir"/*_gamma0-elp.tif \
+        "$product_dir"/*_gamma0-rtc.tif \
         "$product_dir"/DEM_merged.tif \
         "$product_dir"/DEM_merged_res.tif
 }

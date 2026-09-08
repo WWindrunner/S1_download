@@ -7,11 +7,8 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 import numpy as np
-import planetary_computer as pc
 import rasterio
 import requests
-from osgeo import gdal
-from pystac_client import Client
 from rasterio.warp import reproject, Resampling, transform_bounds
 
 start_time = time.perf_counter()
@@ -151,6 +148,88 @@ def pixel_spacing_meters(transform, crs, rows):
 
     return x_spacing, y_spacing
 
+def download_dem(scene_dir, angle_path):
+    """Fallback for scenes without a SNAP DEM export."""
+    import planetary_computer as pc
+    from osgeo import gdal
+    from pystac_client import Client
+
+    dem_dir = os.path.join(scene_dir, "dem_tiles")
+    os.makedirs(dem_dir, exist_ok=True)
+    dem_merge = os.path.join(scene_dir, "DEM_merged.tif")
+    with rasterio.open(angle_path) as angle_source:
+        bbox = transform_bounds(
+            angle_source.crs, "EPSG:4326", *angle_source.bounds, densify_pts=21
+        )
+    # Search for Copernicus DEM tiles covering the Sentinel-1 scene.
+    catalog = Client.open(
+        "https://planetarycomputer.microsoft.com/api/stac/v1"
+    )
+
+    search = catalog.search(
+        collections=["cop-dem-glo-30"],
+        bbox=bbox
+    )
+
+    items = list(search.items())
+
+    if len(items) == 0:
+        raise ValueError("No DEM tiles found")
+
+    print(f"DEM search completed: {len(items)} tiles found.")
+
+    local_files = []
+
+    for i, item in enumerate(items):
+        item = pc.sign(item)
+
+        url = item.assets["data"].href
+
+        out_path = os.path.join(dem_dir, f"dem_{i}.tif")
+
+        # print("Downloading:", url)
+
+        r = requests.get(url, stream=True)
+        r.raise_for_status()
+
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        local_files.append(out_path)
+
+    print(f"DEM download completed: {len(local_files)} tiles.")
+
+    tif_list = glob.glob(os.path.join(dem_dir, "*.tif"))
+    gdal.Warp(
+        dem_merge,
+        tif_list,
+        format="GTiff",
+        options=gdal.WarpOptions(
+            multithread=True,
+            resampleAlg="bilinear",
+            creationOptions=["TILED=YES", "COMPRESS=LZW"],
+        ),
+    )
+
+    return dem_merge
+
+
+def read_snap_dem(dem_path, reference):
+    """Read the exported elevations as-is; do not apply another geoid correction."""
+    with rasterio.open(dem_path) as source:
+        if (source.crs != reference.crs or source.shape != reference.shape
+                or not source.transform.almost_equals(reference.transform)):
+            raise ValueError(f"SNAP DEM grid does not match incidence-angle raster: {dem_path}")
+        if source.count != 1:
+            raise ValueError(f"Expected a single-band SNAP DEM: {dem_path}")
+        dem = source.read(1, masked=True).astype(np.float32).filled(np.nan)
+    dem[~np.isfinite(dem)] = np.nan
+    if not np.any(np.isfinite(dem)):
+        raise ValueError(f"SNAP DEM has no valid elevations: {dem_path}")
+    return dem
+
+
 parser = argparse.ArgumentParser(
     description="Generate a binary LIA > 50 degree exclusion mask."
 )
@@ -198,73 +277,9 @@ if not os.path.isfile(S1_angle_path):
     raise FileNotFoundError(
         f"Ellipsoid incidence-angle raster not found: {S1_angle_path}"
     )
-dem_dir = os.path.join(path, "dem_tiles")
-os.makedirs(dem_dir, exist_ok=True)
-
-dem_merge = os.path.join(path, f"DEM_merged.tif")
-dem_merge_resample = os.path.join(path, f"DEM_merged_res.tif")
-
-with rasterio.open(S1_angle_path) as angle_source:
-    if angle_source.crs is None:
-        raise ValueError(f"Incidence-angle raster has no CRS: {S1_angle_path}")
-    bbox = transform_bounds(
-        angle_source.crs, "EPSG:4326", *angle_source.bounds, densify_pts=21
-    )
-
-# Search for Copernicus DEM tiles covering the Sentinel-1 scene.
-catalog = Client.open(
-    "https://planetarycomputer.microsoft.com/api/stac/v1"
-)
-
-search = catalog.search(
-    collections=["cop-dem-glo-30"],
-    bbox=bbox
-)
-
-items = list(search.items())
-
-if len(items) == 0:
-    raise ValueError("No DEM tiles found")
-
-print(f"DEM search completed: {len(items)} tiles found.")
-
-local_files = []
-
-for i, item in enumerate(items):
-    item = pc.sign(item)
-
-    url = item.assets["data"].href
-
-    out_path = os.path.join(dem_dir, f"dem_{i}.tif")
-
-    # print("Downloading:", url)
-
-    r = requests.get(url, stream=True)
-    r.raise_for_status()
-
-    with open(out_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=8192):
-            f.write(chunk)
-
-    local_files.append(out_path)
-
-print(f"DEM download completed: {len(local_files)} tiles.")
-
-tif_list = glob.glob(os.path.join(dem_dir, "*.tif"))
-gdal.Warp(
-    dem_merge,
-    tif_list,
-    format="GTiff",
-    options=gdal.WarpOptions(
-        multithread=True,
-        resampleAlg="bilinear",
-        creationOptions=["TILED=YES", "COMPRESS=LZW"],
-    ),
-)
-
-# print("DEM mosaic completed.")
-
 with rasterio.open(S1_angle_path) as s1_src:
+    if s1_src.crs is None:
+        raise ValueError(f"Incidence-angle raster has no CRS: {S1_angle_path}")
     s1_masked = s1_src.read(1, masked=True).astype(np.float32)
     s1 = s1_masked.filled(np.nan)
     s1_transform = s1_src.transform
@@ -272,48 +287,44 @@ with rasterio.open(S1_angle_path) as s1_src:
     out_shape = s1.shape
     profile = s1_src.profile.copy()
 
-with rasterio.open(dem_merge) as dem_src:
-    dem_masked = dem_src.read(1, masked=True).astype(np.float32)
-    dem = dem_masked.filled(np.nan)
+# Match the DEM to the same pyroSAR scene prefix as the angle raster.
+angle_suffix = 'incidenceAngleFromEllipsoid.tif'
+if S1_angle_path.endswith(angle_suffix):
+    snap_dem_path = S1_angle_path[:-len(angle_suffix)] + 'DEM.tif'
+else:
+    snap_dem_path = None
 
-    dem_reproj = np.full(out_shape, np.nan, dtype=np.float32)
+using_snap_dem = snap_dem_path is not None and os.path.isfile(snap_dem_path)
+if using_snap_dem:
+    print(f"Reusing SNAP DEM: {snap_dem_path}")
+    with rasterio.open(S1_angle_path) as reference:
+        dem = read_snap_dem(snap_dem_path, reference)
+else:
+    print("No matching SNAP DEM found; downloading Copernicus DEM tiles.")
+    dem_merge = download_dem(path, S1_angle_path)
+    with rasterio.open(dem_merge) as dem_src:
+        dem_masked = dem_src.read(1, masked=True).astype(np.float32)
+        dem = dem_masked.filled(np.nan)
 
-    reproject(
-        source=dem,
-        destination=dem_reproj,
-        src_transform=dem_src.transform,
-        src_crs=dem_src.crs,
-        dst_transform=s1_transform,
-        dst_crs=s1_crs,
-        src_nodata=np.nan,
-        dst_nodata=np.nan,
-        init_dest_nodata=True,
-        resampling=Resampling.bilinear,
-    )
+        dem_reproj = np.full(out_shape, np.nan, dtype=np.float32)
 
+        reproject(
+            source=dem,
+            destination=dem_reproj,
+            src_transform=dem_src.transform,
+            src_crs=dem_src.crs,
+            dst_transform=s1_transform,
+            dst_crs=s1_crs,
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
+            init_dest_nodata=True,
+            resampling=Resampling.bilinear,
+        )
+    dem = dem_reproj
 
-profile.update(
-    dtype="float32",
-    count=1,
-    compress="lzw",
-    tiled=True,
-    blockxsize=256,
-    blockysize=256,
-    BIGTIFF="YES",
-    nodata=np.nan,
-)
-
-with rasterio.open(dem_merge_resample, "w", **profile) as dst:
-    dst.write(dem_reproj.astype(np.float32), 1)
-
-dem_resample_path = os.path.join(path, f"DEM_merged_res.tif")
+transform = s1_transform
+output_crs = s1_crs
 LIA_path = os.path.join(path, f"{S1name}_LIA.tif")
-
-
-with rasterio.open(dem_resample_path) as src:
-    dem = src.read(1, masked=True).astype(np.float32).filled(np.nan)
-    transform = src.transform
-    output_crs = src.crs
 
 # Derive terrain slope and aspect from the resampled DEM.
 pixel_size_x, pixel_size_y = pixel_spacing_meters(
@@ -381,10 +392,11 @@ with rasterio.open(
         radar_azimuth_degrees=AZIMUTH,
     )
 
-shutil.rmtree(dem_dir)
-for temporary_path in (dem_merge, dem_merge_resample):
-    if os.path.isfile(temporary_path):
-        os.remove(temporary_path)
+# Preserve the SNAP DEM; only remove files created by the fallback.
+if not using_snap_dem:
+    shutil.rmtree(os.path.join(path, "dem_tiles"))
+    if os.path.isfile(dem_merge):
+        os.remove(dem_merge)
 
 elapsed = time.perf_counter() - start_time
 print(f"Local incidence angle completed in {elapsed:.2f} seconds.")

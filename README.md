@@ -17,9 +17,11 @@ For each Sentinel-1 product name, the workflow runs the following steps:
      Sentinel-1 grid.
    - Preserves the mask classes using nearest-neighbour resampling.
 3. `cal_LIA.py`
-   - Downloads Copernicus DEM tiles from Microsoft Planetary Computer.
-   - Resamples the DEM to the Sentinel-1 grid and calculates local incidence
-     angle (LIA).
+   - Reuses the matching `*_DEM.tif` exported by SNAP on the Sentinel-1 grid.
+   - Checks its CRS, dimensions, transform, and invalid elevations before
+     calculating local incidence angle (LIA). A mismatched grid raises an error.
+   - If the SNAP DEM is absent, downloads Copernicus DEM tiles from Microsoft
+     Planetary Computer and resamples them to the Sentinel-1 grid.
    - Writes a uint8 exclusion mask: 0 for LIA up to 50 degrees, 1 for LIA
      greater than 50 degrees, and 255 for nodata.
 4. `Snow_detect.py`
@@ -107,4 +109,6 @@ Each Sentinel-1 product is written to its own subdirectory:
     +-- <S1_PRODUCT_NAME>_cloud.tif
 ```
 
-Intermediate SNAP output files are removed after successful completion.
+The `*_DEM.tif` exported by SNAP is retained after successful completion for
+reuse and inspection. Its elevations are used as exported, without applying
+another geoid correction. Other intermediate SNAP output files are removed.

@@ -69,7 +69,7 @@ def download_Sentinel_with_ids_names(ids, name, output_dir, access_token):
 
 def process_snentinel_images(file, processed_path):
     target_resolution = 20
-    terrain_flat_bool = False
+    terrain_flat_bool = True
     remove_therm_noise_bool = True
 
     geocode(
@@ -83,17 +83,17 @@ def process_snentinel_images(file, processed_path):
         clean_edges=True,
         terrainFlattening=terrain_flat_bool,
         removeS1ThermalNoise=remove_therm_noise_bool,
-        export_extra=['incidenceAngleFromEllipsoid', 'localIncidenceAngle'],
-        demName='ACE30',
+        export_extra=['incidenceAngleFromEllipsoid', 'localIncidenceAngle', 'DEM'],
+        demName='Copernicus 30m Global DEM',
         nodataValueAtSea=False,
     )
 
 
 def incidence_process(VV_VH_incidence_path):
-    ds1 = gdal.Open(glob.glob(f"{VV_VH_incidence_path}/*VV_gamma0-elp.tif")[0])
+    ds1 = gdal.Open(glob.glob(f"{VV_VH_incidence_path}/*VV_gamma0-rtc.tif")[0])
     band1 = ds1.GetRasterBand(1).ReadAsArray().astype(float)
 
-    ds2 = gdal.Open(glob.glob(f"{VV_VH_incidence_path}/*VH_gamma0-elp.tif")[0])
+    ds2 = gdal.Open(glob.glob(f"{VV_VH_incidence_path}/*VH_gamma0-rtc.tif")[0])
     band2 = ds2.GetRasterBand(1).ReadAsArray().astype(float)
 
     ds3 = gdal.Open(glob.glob(f"{VV_VH_incidence_path}/*incidenceAngleFromEllipsoid.tif")[0])
