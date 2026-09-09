@@ -106,10 +106,12 @@ python Sentinel_1_ESA_search_download_process_chain_v4.py --search-only \
 
 Both dates are inclusive in UTC. For each day, the search downloads that day's
 GloFAS warning shapefile and queries that day's Sentinel-1 `IW_GRDH_1S` products
-overlapping original warning polygons inside retained regions by at least
-50 km² per scene per region. Bounding boxes serve only as catalogue prefilters;
-final filtering uses product footprints and original polygons (including holes),
-excluding expansion-only and bounding-box-only matches. It follows catalogue
+overlapping original warning pixels inside retained regions by at least
+50 km? per scene per region. Bounding boxes serve as catalogue prefilters;
+final filtering rasterizes each candidate SAR footprint onto the warning grid
+and counts original warning pixels tagged with the current region ID. Expanded
+pixels and other regions inside the same bounding box do not contribute.
+It follows catalogue
 pagination and deduplicates by CDSE product UUID across regions and days.
 No SAR downloads, CDSE credentials, or desert-mask VRT are required in this mode.
 Warning files and intermediate rasters are saved in the work directory.
@@ -140,17 +142,25 @@ confirmation that flooding is visible in the SAR imagery.
 The overlap threshold is `MIN_FLOOD_OVERLAP_KM2 = 50.0` in the workflow script;
 its area conversion remains `geometry.area * 110 * 110`. Both the daily workflow
 and date-range search use this filter, with existing function signatures and
-commands unchanged. Legacy callers supplying only bounds remain supported and
-use that rectangle as their AOI; supply `geometry` for polygon matching or use
-the features returned by `simplify_flood_warning_shp_from_ESA`, which carry the
-original warning polygon in `warning_wkt`. A missing product footprint raises
-an error rather than silently accepting an unverified match.
+commands unchanged. The main workflow returns region features carrying
+`warning_raster` and `warning_region` for pixel filtering. Legacy callers without
+this metadata retain their existing geometry / `warning_wkt` / bounds fallback.
+A missing product footprint raises an error rather than silently accepting an
+unverified match.
 
-Original warning MultiPolygons are indexed by individual polygon parts once per
-day. Each retained region clips and unions only nearby parts, avoiding repeated
-global unions for large GloFAS files. The workflow logs area-selection completion,
-index construction, and each region's clipping progress and elapsed time.
-This optimization preserves the original polygons, overlap threshold and interfaces.
+Step 5 creates a tiled, compressed `*_warning_regions.tif`: 0 denotes background
+and positive values identify retained regions, only on the original pre-expansion
+warning pixels. It rasterizes the existing expanded region polygons in bounded
+512-by-512 tiles; detailed original warning polygons are no longer indexed,
+clipped or unioned. Candidate scenes read only local windows from this raster,
+in bounded tiles, and can stop once the area threshold is reached. Tile progress
+and preparation time are logged. Intermediate files remain on disk as before.
+
+Overlap is now a raster approximation using `all_touched=False`, consistent with
+the original warning rasterization. The existing area convention gives each
+`1/111`-degree pixel about 0.982 km?, so 50 warning pixels fall below the threshold
+and 51 pass. Narrow features and boundary pixels can differ from exact polygon
+intersection; no latitude correction or threshold change is introduced.
 
 ## Output structure
 

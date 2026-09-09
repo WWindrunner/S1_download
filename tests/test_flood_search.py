@@ -9,10 +9,12 @@ from unittest.mock import Mock
 
 import numpy as np
 import pandas as pd
-from shapely.geometry import box, Polygon, MultiPolygon, GeometryCollection, mapping, shape
-from shapely.ops import unary_union
-from shapely.strtree import STRtree
-from numbers import Integral
+from shapely.geometry import box, Polygon, mapping, shape
+import rasterio
+from rasterio.features import rasterize, geometry_window
+from rasterio.windows import Window
+from rasterio.errors import WindowError
+from rasterio.transform import from_origin
 from shapely.wkt import loads
 
 
@@ -25,7 +27,8 @@ class FloodSearchTests(unittest.TestCase):
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
         self.ns = dict(datetime=datetime, os=os, np=np, pd=pd, requests=Mock(),
                        box=box, shape=shape, loads=loads, MIN_FLOOD_OVERLAP_KM2=50.0,
-                       STRtree=STRtree, Integral=Integral, unary_union=unary_union)
+                       rasterio=rasterio, rasterize=rasterize, geometry_window=geometry_window,
+                       Window=Window, WindowError=WindowError, mapping=mapping)
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(SOURCE), "exec"), self.ns)
 
     def test_pagination_and_midnight_boundaries(self):
@@ -90,36 +93,84 @@ class FloodSearchTests(unittest.TestCase):
         self.assertEqual(result, {"names": ["scene-28", "scene-29", "scene-1"], "count": 3})
         self.assertEqual(download.call_count, 3)
 
-    def test_indexed_clipping_matches_previous_geometry(self):
-        outer = box(0, 0, 4, 4)
-        with_hole = Polygon(outer.exterior.coords, [box(1, 1, 2, 2).exterior.coords])
-        source = [MultiPolygon([with_hole, box(100, 100, 101, 101)]),
-                  box(3, 0, 5, 3)]
-        parts, tree = self.ns["_index_warning_parts"](source)
-        for region in [box(-1, -1, 3.5, 4), box(1.1, 1.1, 1.9, 1.9),
-                       box(4, 4, 6, 6), box(50, 50, 51, 51)]:
-            expected = unary_union([g for g in source if g.intersects(region)]).intersection(region)
-            actual = self.ns["_clip_warning_parts"](parts, tree, region)
-            self.assertTrue(actual.equals(expected))
+    def write_raster(self, path, data, transform):
+        with rasterio.open(path, "w", driver="GTiff", height=data.shape[0],
+                           width=data.shape[1], count=1, dtype=data.dtype,
+                           crs="EPSG:4326", transform=transform) as dst:
+            dst.write(data, 1)
 
-    def test_global_multipolygon_unions_only_local_parts(self):
-        source = MultiPolygon([box(i * 2, 0, i * 2 + 1, 1) for i in range(1000)])
-        parts, tree = self.ns["_index_warning_parts"]([source])
-        union = self.ns["unary_union"] = Mock(wraps=unary_union)
-        result = self.ns["_clip_warning_parts"](parts, tree, box(-0.1, -0.1, 1.1, 1.1))
-        self.assertTrue(result.equals(box(0, 0, 1, 1)))
-        self.assertEqual(len(union.call_args.args[0]), 1)
-        legacy_tree = Mock()
-        legacy_tree.query.return_value = [parts[0]]
-        self.assertTrue(self.ns["_clip_warning_parts"](
-            parts, legacy_tree, box(-0.1, -0.1, 1.1, 1.1)
-        ).equals(result))
+    def test_warning_region_raster_excludes_expansion_and_other_regions(self):
+        transform = from_origin(0, 20 / 111, 1 / 111, 1 / 111)
+        original = np.ones((20, 20), dtype="uint8")
+        original[2:5, 2:5] = 0
+        outer = box(0, 0, 20 / 111, 20 / 111)
+        inner = box(5 / 111, 5 / 111, 15 / 111, 15 / 111)
+        ring = Polygon(outer.exterior.coords, [inner.exterior.coords])
+        regions = pd.DataFrame({"geometry": [ring, inner], "warning_region": [1, 2]})
+        with tempfile.TemporaryDirectory() as directory:
+            original_path = os.path.join(directory, "original.tif")
+            output_path = os.path.join(directory, "labels.tif")
+            self.write_raster(original_path, original, transform)
+            self.ns["_write_warning_region_raster"](original_path, regions, output_path)
+            with rasterio.open(output_path) as src:
+                labels = src.read(1)
+                self.assertEqual(src.transform, transform)
+            self.assertTrue(np.all(labels[2:5, 2:5] == 0))
+            self.assertTrue(np.all(labels[5:15, 5:15] == 2))
+            feature = dict(minx=0, miny=0, maxx=20/111, maxy=20/111,
+                           warning_raster=output_path, warning_region=1)
+            product = {"GeoFootprint": mapping(inner)}
+            self.assertFalse(self.ns["_has_raster_flood_overlap"](product, feature))
+            feature["warning_region"] = 2
+            self.assertTrue(self.ns["_has_raster_flood_overlap"](product, feature))
 
-    def test_empty_warning_index(self):
-        parts, tree = self.ns["_index_warning_parts"]([None, GeometryCollection()])
-        self.assertEqual(parts, [])
-        self.assertIsNone(tree)
-        self.assertTrue(self.ns["_clip_warning_parts"](parts, tree, box(0, 0, 1, 1)).is_empty)
+    def test_pixel_threshold_and_catalogue_integration(self):
+        transform = from_origin(0, 20 / 111, 1 / 111, 1 / 111)
+        footprint = box(0, 0, 20 / 111, 20 / 111)
+        product = {"Id": "a", "Name": "scene.SAFE", "GeoFootprint": mapping(footprint)}
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "labels.tif")
+            feature = dict(minx=0, miny=0, maxx=20/111, maxy=20/111,
+                           warning_raster=path, warning_region=1)
+            for count, expected in [(0, False), (50, False), (51, True)]:
+                labels = np.zeros((20, 20), dtype="uint32")
+                labels.flat[:count] = 1
+                self.write_raster(path, labels, transform)
+                self.assertEqual(self.ns["_has_raster_flood_overlap"](product, feature), expected)
+            # Confirm the real search dispatch uses pixels, not legacy geometry.
+            self.ns["_warning_geometry"] = Mock(side_effect=AssertionError("unexpected geometry path"))
+            response = Mock()
+            response.json.return_value = {"value": [product]}
+            self.ns["requests"].get.return_value = response
+            result = self.ns["search_sentinel_with_shape_extent_and_data"](
+                pd.DataFrame(columns=["Id", "Name"]), 2025, 4, 1, feature)
+            self.assertEqual(result.Id.tolist(), ["a"])
+            self.assertFalse(self.ns["_has_raster_flood_overlap"](
+                {"GeoFootprint": mapping(box(10, 10, 11, 11))}, feature))
+            # A footprint hole excludes warning pixels, even with a large bbox.
+            hole = Polygon(footprint.exterior.coords,
+                           [box(0.0001, 0.0001, 19.99/111, 19.99/111).exterior.coords])
+            self.assertFalse(self.ns["_has_raster_flood_overlap"](
+                {"GeoFootprint": mapping(hole)}, feature))
+
+    def test_raster_tiles_preserve_counts_across_boundary(self):
+        transform = from_origin(0, 1 / 111, 1 / 111, 1 / 111)
+        original = np.zeros((1, 540), dtype="uint8")
+        original[0, 490:540] = 1
+        original[0, 0] = 1
+        footprint = box(0, 0, 540 / 111, 1 / 111)
+        regions = pd.DataFrame({"geometry": [footprint], "warning_region": [1]})
+        with tempfile.TemporaryDirectory() as directory:
+            original_path = os.path.join(directory, "original.tif")
+            output_path = os.path.join(directory, "labels.tif")
+            self.write_raster(original_path, original, transform)
+            self.ns["_write_warning_region_raster"](original_path, regions, output_path)
+            with rasterio.open(output_path) as src:
+                np.testing.assert_array_equal(src.read(1), original)
+            feature = dict(minx=0, miny=0, maxx=540/111, maxy=1/111,
+                           warning_raster=output_path, warning_region=1)
+            self.assertTrue(self.ns["_has_raster_flood_overlap"](
+                {"Footprint": f"geography'SRID=4326;{footprint.wkt}'"}, feature))
 
     def test_empty_invalid_and_failed_searches(self):
         self.ns["download_flood_warning_shp_from_ESA"] = Mock()

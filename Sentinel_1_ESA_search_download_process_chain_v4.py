@@ -8,9 +8,6 @@ import warnings
 warnings.filterwarnings("ignore")
 import json
 from shapely.geometry import shape, MultiPolygon, LineString, mapping, box
-from shapely.ops import unary_union
-from shapely.strtree import STRtree
-from numbers import Integral
 from time import perf_counter
 from shapely.wkt import loads, dumps
 import xml.etree.ElementTree as ET
@@ -28,7 +25,9 @@ import sys
 import zipfile
 import io
 import rasterio
-from rasterio.features import rasterize
+from rasterio.features import rasterize, geometry_window
+from rasterio.windows import Window
+from rasterio.errors import WindowError
 from rasterio.transform import from_origin
 import numpy as np
 from scipy.ndimage import maximum_filter
@@ -74,7 +73,6 @@ def simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds):
     gdf = gpd.read_file(shapefile)
     if gdf.empty:
         return gdf
-    original_warnings = gdf.copy()
     pixel_size = 1/111
     minx, miny, maxx, maxy = gdf.total_bounds
     width = int((maxx - minx) / pixel_size)
@@ -99,6 +97,7 @@ def simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds):
         count=1,
         dtype=raster.dtype,
         crs=gdf.crs,
+        tiled=True, blockxsize=512, blockysize=512, compress='deflate',
         transform=transform
     ) as dst:
         dst.write(raster, 1)
@@ -146,54 +145,89 @@ def simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds):
     gdf_filtered_over_10000["miny"] = gdf_filtered_over_10000.bounds.miny
     gdf_filtered_over_10000["maxx"] = gdf_filtered_over_10000.bounds.maxx
     gdf_filtered_over_10000["maxy"] = gdf_filtered_over_10000.bounds.maxy
-    # Preserve the existing expanded geometry, bounds, files and area selection.
-    # Carry original warning geometry separately for precise scene filtering.
     print(f"finished! Retained {len(gdf_filtered_over_10000)} regions.", flush=True)
-    warning_wkts = []
+    # Keep original warning pixels only, tagged by their retained expanded region.
+    warning_raster = os.path.abspath(f"{base_filename}_warning_regions.tif")
+    gdf_filtered_over_10000 = gdf_filtered_over_10000.copy()
+    gdf_filtered_over_10000["warning_region"] = np.arange(1, len(gdf_filtered_over_10000) + 1)
+    gdf_filtered_over_10000["warning_raster"] = warning_raster
     if not gdf_filtered_over_10000.empty:
-        print("5. Indexing original warning polygon parts...", flush=True)
+        print("5. Preparing original warning pixels by region...", flush=True)
         started = perf_counter()
-        parts, tree = _index_warning_parts(original_warnings.geometry)
-        print(f"Indexed {len(parts)} parts in {perf_counter() - started:.1f}s.", flush=True)
-        for number, region in enumerate(gdf_filtered_over_10000.geometry, 1):
-            started = perf_counter()
-            print(f"   Clipping original warnings for region {number}/{len(gdf_filtered_over_10000)}...",
-                  flush=True)
-            warning_wkts.append(_clip_warning_parts(parts, tree, region).wkt)
-            print(f"   Finished region {number} in {perf_counter() - started:.1f}s.", flush=True)
-    gdf_filtered_over_10000["warning_wkt"] = warning_wkts
+        _write_warning_region_raster(out_tif, gdf_filtered_over_10000, warning_raster)
+        print(f"Warning pixels ready in {perf_counter() - started:.1f}s.", flush=True)
     return gdf_filtered_over_10000
 
 
-def _index_warning_parts(geometries):
-    """Index individual polygons once, even for a single global MultiPolygon."""
-    parts = []
+def _write_warning_region_raster(original_path, regions, output_path):
+    """Write region IDs on original warning pixels using bounded raster tiles.
 
-    def collect(geometry):
-        if geometry is None or geometry.is_empty:
-            return
-        if geometry.geom_type == "Polygon":
-            parts.append(geometry)
-        elif geometry.geom_type in ("MultiPolygon", "GeometryCollection"):
-            for part in geometry.geoms:
-                collect(part)
+    Region polygons come from the expanded binary raster; rasterizing them back
+    to that same grid preserves connected-region membership without processing
+    the detailed original warning polygons. Zero denotes non-warning pixels or
+    regions rejected by the existing area filter.
+    """
+    geometries = list(regions.geometry)
+    bounds = np.array([geometry.bounds for geometry in geometries])
+    ids = regions["warning_region"].to_numpy()
+    with rasterio.open(original_path) as src:
+        profile = src.profile.copy()
+        profile.update(dtype="uint32", nodata=0, tiled=True, blockxsize=512,
+                       blockysize=512, compress="deflate", BIGTIFF="IF_SAFER")
+        with rasterio.open(output_path, "w", **profile) as dst:
+            total = ((src.width + 511) // 512) * ((src.height + 511) // 512)
+            for number, (_, window) in enumerate(dst.block_windows(1), 1):
+                left, bottom, right, top = src.window_bounds(window)
+                candidates = np.flatnonzero(
+                    (bounds[:, 0] < right) & (bounds[:, 2] > left)
+                    & (bounds[:, 1] < top) & (bounds[:, 3] > bottom)
+                )
+                labels = np.zeros((int(window.height), int(window.width)), dtype="uint32")
+                if len(candidates):
+                    original = src.read(1, window=window) == 1
+                    if original.any():
+                        rasterize([(geometries[i], int(ids[i])) for i in candidates],
+                                  out=labels, transform=src.window_transform(window),
+                                  all_touched=False)
+                        labels[~original] = 0
+                dst.write(labels, 1, window=window)
+                if number % 100 == 0 or number == total:
+                    print(f"   Warning raster tiles: {number}/{total}", flush=True)
 
-    for geometry in geometries:
-        collect(geometry)
-    return parts, STRtree(parts) if parts else None
 
-
-def _clip_warning_parts(parts, tree, region):
-    """Union only local clipped parts, preserving holes and overlap semantics."""
-    clipped = []
-    if tree is not None:
-        for candidate in tree.query(region):
-            # Shapely 2 returns indices; Shapely 1 returns geometry objects.
-            part = parts[int(candidate)] if isinstance(candidate, Integral) else candidate
-            intersection = part.intersection(region)
-            if not intersection.is_empty:
-                clipped.append(intersection)
-    return unary_union(clipped)
+def _has_raster_flood_overlap(product, feature):
+    """Count original warning pixels for this region inside a SAR footprint."""
+    footprint = _product_footprint(product)
+    if footprint.is_empty:
+        return False
+    region_box = box(feature["minx"], feature["miny"], feature["maxx"], feature["maxy"])
+    extent = box(*footprint.bounds).intersection(region_box)
+    if extent.is_empty or extent.area == 0:
+        return False
+    with rasterio.open(feature["warning_raster"]) as src:
+        try:
+            window = geometry_window(src, [mapping(extent)])
+        except WindowError:
+            return False
+        transform = src.transform
+        pixel_area_km2 = abs(transform.a * transform.e - transform.b * transform.d) * 110 * 110
+        count = 0
+        # Bound memory even for very large or multipart scene footprints.
+        row_stop = int(window.row_off + window.height)
+        col_stop = int(window.col_off + window.width)
+        for row in range(int(window.row_off), row_stop, 512):
+            for col in range(int(window.col_off), col_stop, 512):
+                tile = Window(col, row, min(512, col_stop - col), min(512, row_stop - row))
+                selected = src.read(1, window=tile) == int(feature["warning_region"])
+                if not selected.any():
+                    continue
+                coverage = rasterize([(mapping(footprint), 1)], out_shape=selected.shape,
+                                     transform=src.window_transform(tile), dtype="uint8",
+                                     all_touched=False)
+                count += int(np.count_nonzero(selected & (coverage == 1)))
+                if count * pixel_area_km2 >= MIN_FLOOD_OVERLAP_KM2:
+                    return True
+    return False
 
 
 def _warning_geometry(feature):
@@ -207,8 +241,8 @@ def _warning_geometry(feature):
     return box(feature["minx"], feature["miny"], feature["maxx"], feature["maxy"])
 
 
-def _has_flood_overlap(product, warning_geometry):
-    """Filter real footprint overlap, retaining the project's area convention."""
+def _product_footprint(product):
+    """Read a catalogue footprint in either supported representation."""
     footprint = product.get("GeoFootprint")
     if footprint:
         footprint = shape(footprint)
@@ -218,19 +252,25 @@ def _has_flood_overlap(product, warning_geometry):
             raise ValueError(f"Missing footprint for Sentinel-1 product {product.get('Id')}")
         footprint = footprint.split(";", 1)[-1].strip().strip("'")
         footprint = loads(footprint)
-    overlap = footprint.intersection(warning_geometry)
+    return footprint
+
+
+def _has_flood_overlap(product, warning_geometry):
+    """Preserve geometric filtering for legacy callers without raster metadata."""
+    overlap = _product_footprint(product).intersection(warning_geometry)
     return not overlap.is_empty and overlap.area * 110 * 110 >= MIN_FLOOD_OVERLAP_KM2
 
 
 def search_sentinel_with_shape_extent_and_data(df,year,month,day,feature):
     """Keep the legacy signature; filter candidates by >=50 km2 warning overlap.
 
-    The catalogue bounding box is only a coarse prefilter. Original polygons
-    supplied by simplify_flood_warning_shp_from_ESA determine final acceptance.
+    The catalogue bounding box is only a coarse prefilter. Original warning
+    pixels belonging to this retained region determine final acceptance.
     Legacy bounds-only features still work, using their rectangle as the AOI.
     """
-    warning_geometry = _warning_geometry(feature)
-    if warning_geometry.is_empty:
+    use_raster = bool(feature.get("warning_raster"))
+    warning_geometry = None if use_raster else _warning_geometry(feature)
+    if not use_raster and warning_geometry.is_empty:
         return df
 
     start_date = f"{year}-{str(month).zfill(2)}-{str(day).zfill(2)}T00:00:00.000Z"
@@ -259,7 +299,8 @@ def search_sentinel_with_shape_extent_and_data(df,year,month,day,feature):
         response_json = response.json()
         df2 = pd.DataFrame.from_dict([
             product for product in response_json['value']
-            if _has_flood_overlap(product, warning_geometry)
+            if (_has_raster_flood_overlap(product, feature) if use_raster
+                else _has_flood_overlap(product, warning_geometry))
         ])
         if not df2.empty:
             df = pd.concat([df, df2], ignore_index=True)
