@@ -94,6 +94,57 @@ python Snow_detect.py <S1_PRODUCT_NAME> <OUTPUT_FOLDER>
 They discover inputs under `<OUTPUT_FOLDER>/<S1_PRODUCT_NAME>/`. Both the
 legacy and explicit calling forms use the same scene-prefixed output names.
 
+## Search flood-warning SAR images over a date range
+
+Run in the project's Conda environment:
+
+```bash
+python Sentinel_1_ESA_search_download_process_chain_v4.py --search-only \
+  --start-date 2025-10-01 --end-date 2025-10-07 \
+  --work-directory ./data --output-json flood_images.json
+```
+
+Both dates are inclusive in UTC. For each day, the search downloads that day's
+GloFAS warning shapefile and queries that day's Sentinel-1 `IW_GRDH_1S` products
+overlapping original warning polygons inside retained regions by at least
+50 km² per scene per region. Bounding boxes serve only as catalogue prefilters;
+final filtering uses product footprints and original polygons (including holes),
+excluding expansion-only and bounding-box-only matches. It follows catalogue
+pagination and deduplicates by CDSE product UUID across regions and days.
+No SAR downloads, CDSE credentials, or desert-mask VRT are required in this mode.
+Warning files and intermediate rasters are saved in the work directory.
+Missing warning data or request failures stop the search with the affected date;
+they are not silently counted as zero images.
+
+The JSON result contains `ids` (UUIDs used for downloading), `count` (unique
+product count), and `images` (records with `Id` and `Name`). The same result is
+available from Python without triggering the processing workflow on import:
+
+```python
+from Sentinel_1_ESA_search_download_process_chain_v4 import search_flood_images_by_date_range
+
+result = search_flood_images_by_date_range("2025-10-01", "2025-10-07", "./data")
+print(result["ids"], result["count"])
+```
+
+Defaults match the daily warning workflow: raster size `1/111` degrees,
+`--window-size 10` (10 by 10 maximum filter), and `--area-thresholds 1000`
+(strictly greater than 1000 square kilometres after expansion). Area is currently
+approximated by geometry area in square degrees multiplied by `110 * 110`,
+so it is not an equal-area measurement. All input warning geometries are used;
+the code applies no warning probability, discharge, return-period or severity
+attribute threshold. Matches are candidate scenes over warning areas, not
+confirmation that flooding is visible in the SAR imagery.
+
+The overlap threshold is `MIN_FLOOD_OVERLAP_KM2 = 50.0` in the workflow script;
+its area conversion remains `geometry.area * 110 * 110`. Both the daily workflow
+and date-range search use this filter, with existing function signatures and
+commands unchanged. Legacy callers supplying only bounds remain supported and
+use that rectangle as their AOI; supply `geometry` for polygon matching or use
+the features returned by `simplify_flood_warning_shp_from_ESA`, which carry the
+original warning polygon in `warning_wkt`. A missing product footprint raises
+an error rather than silently accepting an unverified match.
+
 ## Output structure
 
 Each Sentinel-1 product is written to its own subdirectory:

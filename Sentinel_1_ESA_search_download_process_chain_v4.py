@@ -1,5 +1,5 @@
 #import packages
-import os  
+import os
 import geopandas as gpd
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -7,7 +7,8 @@ import matplotlib.patches as mpatches
 import warnings
 warnings.filterwarnings("ignore")
 import json
-from shapely.geometry import shape, MultiPolygon, LineString, mapping
+from shapely.geometry import shape, MultiPolygon, LineString, mapping, box
+from shapely.ops import unary_union
 from shapely.wkt import loads, dumps
 import xml.etree.ElementTree as ET
 import re
@@ -23,7 +24,6 @@ import subprocess
 import sys
 import zipfile
 import io
-import wget
 import rasterio
 from rasterio.features import rasterize
 from rasterio.transform import from_origin
@@ -34,13 +34,11 @@ from tqdm import tqdm
 from sys import stdout
 import glob
 os.environ['PATH'] += ':/shared/stormcenter/zby3135/Software/snap/bin/'
-os.system('cls' if os.name == 'nt' else 'clear')
 import shutil
-from pyroSAR.snap.util import geocode,ID,identify,sub_parametrize
 import pdb
-from osgeo import gdal
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MIN_FLOOD_OVERLAP_KM2 = 50.0
 
 def log_in(username,password):
     auth_url = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
@@ -61,22 +59,20 @@ def log_in(username,password):
 def download_flood_warning_shp_from_ESA(year,month,day, directory):
     glofas_date = datetime.datetime(year, month, day).strftime("%Y%m%dT00:00Z")
     url = f"https://european-flood.emergency.copernicus.eu/api/fms/download/glofas/RapidFloodMapping/{glofas_date}"
-    try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            with zipfile.ZipFile(io.BytesIO(response.content)) as z:
-                z.extractall(path=directory)
-            print(f"GloFAS data ready. Process Flood warning data:")
-        else:
-            print(f"Failed to download GloFAS data. Status code: {response.status_code}")
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    response = requests.get(url, timeout=120)
+    response.raise_for_status()
+    with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+        z.extractall(path=directory)
+    print("GloFAS data ready. Process Flood warning data:")
 
 def simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds):
     # Rasterize
     base_filename = os.path.splitext(shapefile)[0]
     gdf = gpd.read_file(shapefile)
-    pixel_size = 1/111  
+    if gdf.empty:
+        return gdf
+    original_warnings = gdf.copy()
+    pixel_size = 1/111
     minx, miny, maxx, maxy = gdf.total_bounds
     width = int((maxx - minx) / pixel_size)
     height = int((maxy - miny) / pixel_size)
@@ -99,7 +95,7 @@ def simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds):
         width=width,
         count=1,
         dtype=raster.dtype,
-        crs=gdf.crs,  
+        crs=gdf.crs,
         transform=transform
     ) as dst:
         dst.write(raster, 1)
@@ -115,13 +111,13 @@ def simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds):
     with rasterio.open(f"{base_filename}_simplified_filtered.tif", 'w', **profile) as dst:
         dst.write(result, 1)
     print("finished!")
-    
+
     # Window filter vectorize
     print("3. Window filter vectorize......", end="", flush=True)
     raster_path = f"{base_filename}_simplified_filtered.tif"
     with rasterio.open(raster_path) as src:
-        image = src.read(1)  
-        mask = image != src.nodata  
+        image = src.read(1)
+        mask = image != src.nodata
         transform = src.transform
         crs = src.crs
     results = []
@@ -147,16 +143,60 @@ def simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds):
     gdf_filtered_over_10000["miny"] = gdf_filtered_over_10000.bounds.miny
     gdf_filtered_over_10000["maxx"] = gdf_filtered_over_10000.bounds.maxx
     gdf_filtered_over_10000["maxy"] = gdf_filtered_over_10000.bounds.maxy
+    # Preserve the existing expanded geometry, bounds, files and area selection.
+    # Carry original warning geometry separately for precise scene filtering.
+    gdf_filtered_over_10000["warning_wkt"] = [
+        unary_union(list(original_warnings.geometry[
+            original_warnings.geometry.intersects(region)
+        ])).intersection(region).wkt
+        for region in gdf_filtered_over_10000.geometry
+    ]
     print("finished!")
     return gdf_filtered_over_10000
 
 
+def _warning_geometry(feature):
+    """Prefer original warnings; accept legacy geometry/bounds-only features."""
+    warning_wkt = feature.get("warning_wkt")
+    if isinstance(warning_wkt, str) and warning_wkt:
+        return loads(warning_wkt)
+    geometry = feature.get("geometry")
+    if geometry is not None:
+        return geometry
+    return box(feature["minx"], feature["miny"], feature["maxx"], feature["maxy"])
+
+
+def _has_flood_overlap(product, warning_geometry):
+    """Filter real footprint overlap, retaining the project's area convention."""
+    footprint = product.get("GeoFootprint")
+    if footprint:
+        footprint = shape(footprint)
+    else:
+        footprint = product.get("Footprint")
+        if not footprint:
+            raise ValueError(f"Missing footprint for Sentinel-1 product {product.get('Id')}")
+        footprint = footprint.split(";", 1)[-1].strip().strip("'")
+        footprint = loads(footprint)
+    overlap = footprint.intersection(warning_geometry)
+    return not overlap.is_empty and overlap.area * 110 * 110 >= MIN_FLOOD_OVERLAP_KM2
+
+
 def search_sentinel_with_shape_extent_and_data(df,year,month,day,feature):
+    """Keep the legacy signature; filter candidates by >=50 km2 warning overlap.
+
+    The catalogue bounding box is only a coarse prefilter. Original polygons
+    supplied by simplify_flood_warning_shp_from_ESA determine final acceptance.
+    Legacy bounds-only features still work, using their rectangle as the AOI.
+    """
+    warning_geometry = _warning_geometry(feature)
+    if warning_geometry.is_empty:
+        return df
 
     start_date = f"{year}-{str(month).zfill(2)}-{str(day).zfill(2)}T00:00:00.000Z"
-    end_date   = f"{year}-{str(month).zfill(2)}-{str(day).zfill(2)}T23:59:59.999Z"
+    next_day = datetime.date(year, month, day) + datetime.timedelta(days=1)
+    end_date = f"{next_day.isoformat()}T00:00:00.000Z"
     coords = [
-        (feature["minx"], feature["maxy"]),  # ⌈ leftup 
+        (feature["minx"], feature["maxy"]),  # ⌈ leftup
         (feature["minx"], feature["miny"]),  # ⌊ leftdown
         (feature["maxx"], feature["miny"]),  # ⌋ rightdown
         (feature["maxx"], feature["maxy"]),  # ⌉ rightup
@@ -169,15 +209,67 @@ def search_sentinel_with_shape_extent_and_data(df,year,month,day,feature):
         "and Collection/Name eq 'SENTINEL-1' "
         "and Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'productType' "
         "and att/OData.CSC.StringAttribute/Value eq 'IW_GRDH_1S') "
-        f"and ContentDate/Start gt {start_date} "
+        f"and ContentDate/Start ge {start_date} "
         f"and ContentDate/Start lt {end_date}"
     )
-    response = requests.get(query_url)
-    response_json = response.json()
-    df2 = pd.DataFrame.from_dict(response_json['value'])
-    if not df2.empty:
-        df = pd.concat([df, df2], ignore_index=True)
+    while query_url:
+        response = requests.get(query_url, timeout=120)
+        response.raise_for_status()
+        response_json = response.json()
+        df2 = pd.DataFrame.from_dict([
+            product for product in response_json['value']
+            if _has_flood_overlap(product, warning_geometry)
+        ])
+        if not df2.empty:
+            df = pd.concat([df, df2], ignore_index=True)
+        query_url = response_json.get('@odata.nextLink') or response_json.get('@OData.nextLink')
     return df
+
+
+def search_flood_images_by_date_range(start_date, end_date, work_directory,
+                                     window_size=10, area_thresholds=1000):
+    """Return unique CDSE IDs, names and count for daily warning-area SAR scenes.
+
+    Dates are YYYY-MM-DD strings, inclusive in UTC. Each day's GloFAS mask
+    selects that same day's Sentinel-1 IW_GRDH_1S acquisitions. Warning files
+    and intermediate masks are saved under work_directory; SAR is not downloaded.
+    Any missing warning archive or failed catalogue request raises an exception
+    rather than returning an incomplete count as a successful result.
+    """
+    start = datetime.date.fromisoformat(start_date)
+    end = datetime.date.fromisoformat(end_date)
+    if start > end:
+        raise ValueError("start_date must be on or before end_date")
+    if not isinstance(window_size, int) or isinstance(window_size, bool) or window_size < 1:
+        raise ValueError("window_size must be a positive integer")
+    if not np.isfinite(area_thresholds) or area_thresholds < 0:
+        raise ValueError("area_thresholds must be finite and nonnegative")
+
+    products = {}
+    current = start
+    while current <= end:
+        directory = os.path.join(work_directory, current.isoformat(), "ESA_flood_waring")
+        os.makedirs(directory, exist_ok=True)
+        print(f"Searching flood-warning images for {current.isoformat()}", flush=True)
+        try:
+            download_flood_warning_shp_from_ESA(
+                current.year, current.month, current.day, directory
+            )
+            shapefile = os.path.join(directory, f"FloodMaskMerged{current:%Y%m%d}00.shp")
+            regions = simplify_flood_warning_shp_from_ESA(shapefile, window_size, area_thresholds)
+            daily = pd.DataFrame(columns=["Id", "Name"])
+            for _, feature in regions.iterrows():
+                daily = search_sentinel_with_shape_extent_and_data(
+                    daily, current.year, current.month, current.day, feature
+                )
+            for product in daily[["Id", "Name"]].to_dict("records"):
+                products.setdefault(product["Id"], product)
+        except Exception as exc:
+            raise RuntimeError(f"Flood image search failed for {current.isoformat()}: {exc}") from exc
+        current += datetime.timedelta(days=1)
+
+    images = list(products.values())
+    return {"ids": list(products), "count": len(products), "images": images}
 
 
 def download_Sentinel_with_ids_names(ids,name,output_dir,access_token):
@@ -205,6 +297,7 @@ def download_Sentinel_with_ids_names(ids,name,output_dir,access_token):
             print(f"Error ({r.status_code}): {r.text}")
 
 def process_snentinel_images(file,processed_path):
+    from pyroSAR.snap.util import geocode, identify, sub_parametrize
 
     target_resolution = 20
     terrain_flat_bool = True
@@ -212,7 +305,7 @@ def process_snentinel_images(file,processed_path):
     fileid = identify(file)
     corners = fileid.getCorners()
     subsetnode = sub_parametrize(fileid, geometry=corners)
-    
+
     geocode(
         infile=file,
         outdir=processed_path,
@@ -232,6 +325,7 @@ def process_snentinel_images(file,processed_path):
     print
 
 def incidence_process(VV_VH_incidence_path):
+    from osgeo import gdal
     ds1 = gdal.Open(glob.glob(f"{VV_VH_incidence_path}/*VV_gamma0-rtc.tif")[0])
     band1 = ds1.GetRasterBand(1).ReadAsArray().astype(float)
 
@@ -289,9 +383,9 @@ def incidence_process(VV_VH_incidence_path):
     out_ds = None
     ds1 = None
     ds2 = None
-    
+
     pattern = os.path.join(VV_VH_incidence_path, 'S1A*')
-    
+
     for file in glob.glob(pattern):
         try:
             os.remove(file)
@@ -399,112 +493,139 @@ def run_new_processing_chain(product_name, output_dir, desert_mask_vrt):
 
 
 
-    
-# parameters
-username = os.environ.get("CDSE_USERNAME", "")
-password = os.environ.get("CDSE_PASSWORD", "")
-if not username or not password:
-    raise RuntimeError(
-        "Set CDSE_USERNAME and CDSE_PASSWORD before running the flood-warning "
-        "workflow."
+
+def main():
+    global username, password
+    parser = argparse.ArgumentParser(
+        description="Process today's GloFAS flood warnings with Sentinel-1 data."
     )
+    parser.add_argument(
+        "--desert-mask-vrt",
+        help="Path to the global desert-mask VRT used by Desert_mask.py.",
+    )
+    parser.add_argument("--search-only", action="store_true", help="List flood-area SAR products without downloading SAR.")
+    parser.add_argument("--start-date", help="First UTC date, YYYY-MM-DD (inclusive).")
+    parser.add_argument("--end-date", help="Last UTC date, YYYY-MM-DD (inclusive).")
+    parser.add_argument("--work-directory", default=os.path.join(SCRIPT_DIR, "data"))
+    parser.add_argument("--output-json", help="Save IDs, product names and count to this JSON file.")
+    parser.add_argument("--window-size", type=int, default=10)
+    parser.add_argument("--area-thresholds", type=float, default=1000)
+    args = parser.parse_args()
+    if args.search_only:
+        if not args.start_date or not args.end_date:
+            parser.error("--search-only requires --start-date and --end-date")
+        result = search_flood_images_by_date_range(
+            args.start_date, args.end_date, args.work_directory,
+            window_size=args.window_size, area_thresholds=args.area_thresholds,
+        )
+        output = json.dumps(result, indent=2)
+        if args.output_json:
+            with open(args.output_json, "w", encoding="utf-8") as stream:
+                stream.write(output + "\n")
+        print(output)
+        return
+    if args.start_date or args.end_date or args.output_json:
+        parser.error("Date-range and JSON output options require --search-only")
+    if not args.desert_mask_vrt:
+        parser.error("--desert-mask-vrt is required for processing")
+    username = os.environ.get("CDSE_USERNAME", "")
+    password = os.environ.get("CDSE_PASSWORD", "")
+    if not username or not password:
+        raise RuntimeError(
+            "Set CDSE_USERNAME and CDSE_PASSWORD before running the flood-warning "
+            "workflow."
+        )
+    desert_mask_vrt = os.path.abspath(os.path.expanduser(args.desert_mask_vrt))
+    if not os.path.isfile(desert_mask_vrt):
+        parser.error(f"Desert mask VRT not found: {desert_mask_vrt}")
 
-parser = argparse.ArgumentParser(
-    description="Process today's GloFAS flood warnings with Sentinel-1 data."
-)
-parser.add_argument(
-    "--desert-mask-vrt",
-    required=True,
-    help="Path to the global desert-mask VRT used by Desert_mask.py.",
-)
-args = parser.parse_args()
-desert_mask_vrt = os.path.abspath(os.path.expanduser(args.desert_mask_vrt))
-if not os.path.isfile(desert_mask_vrt):
-    parser.error(f"Desert mask VRT not found: {desert_mask_vrt}")
+
+    # 获取当前时间
+    now =  datetime.datetime.now()
+
+    # 年、月、日
+    year = now.year
+    month = now.month
+    day = now.day
+
+    # year = 2025
+    # month = 10
+    # day = 29
+
+    project_root = os.path.abspath(
+        os.path.expanduser(os.environ.get("RAPID_PROJECT_DIR", SCRIPT_DIR))
+    )
+    workfolder = os.path.join(
+        project_root,
+        "data",
+        f"{year}-{str(month).zfill(2)}-{str(day).zfill(2)}",
+    )
+    os.makedirs(workfolder, exist_ok=True)
 
 
-# 获取当前时间
-now =  datetime.datetime.now()
+    window_size = args.window_size
+    area_thresholds = args.area_thresholds
 
-# 年、月、日
-year = now.year
-month = now.month
-day = now.day
+    # Main program
 
-# year = 2025
-# month = 10
-# day = 29
+    # path set up
+    flood_waring_directory = os.path.join(workfolder, "ESA_flood_waring")
+    os.makedirs(flood_waring_directory, exist_ok=True)
+    Sentinel_process_dir = os.path.join(workfolder, "Sentinel_1")
+    os.makedirs(Sentinel_process_dir, exist_ok=True)
+    processed_images_dir = os.path.join(Sentinel_process_dir, "processed_images")
+    os.makedirs(processed_images_dir, exist_ok=True)
+    glofas_date_name = datetime.datetime(year, month, day).strftime("%Y%m%d")
+    shapefile = os.path.join(
+        flood_waring_directory,
+        f"FloodMaskMerged{glofas_date_name}00.shp",
+    )
+    Processed_Sentinel_1_data_path_filename = os.path.join(
+        workfolder,
+        f"Processed_Sentinel_1_data_path_{glofas_date_name}.txt",
+    )
+    if os.path.exists(Processed_Sentinel_1_data_path_filename):
+        os.remove(Processed_Sentinel_1_data_path_filename)
 
-project_root = os.path.abspath(
-    os.path.expanduser(os.environ.get("RAPID_PROJECT_DIR", SCRIPT_DIR))
-)
-workfolder = os.path.join(
-    project_root,
-    "data",
-    f"{year}-{str(month).zfill(2)}-{str(day).zfill(2)}",
-)
-os.makedirs(workfolder, exist_ok=True) 
+    # download ESA flood warning data
+    download_flood_warning_shp_from_ESA(year,month,day, flood_waring_directory)
+    gdf = simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds)
+    df = pd.DataFrame(columns=["Id", "Name"])
+
+    # Search Sentinel-1 images with extent and date
+    print("\nSearching images......", end="", flush=True)
+    for idx, feature in gdf.iterrows():
+        df = search_sentinel_with_shape_extent_and_data(df,year,month,day,feature)
+    print(f"finished!")
+    if not df.empty:
+        df = df.drop_duplicates(subset=["Name"]).reset_index(drop=True)
+    print(f"Found {len(df)} images")
+    for idx, row in df[['Id','Name']].iterrows():
+        print(f"No.{idx+1}", row['Id'], row['Name'])
+
+    # download images and process images to gamm0
+    if len(df)==0:
+        print(f"No images on {glofas_date_name}")
+        # shutil.rmtree(workfolder)
+    else:
+
+        for idx, row in df.iterrows():
+            name = row["Name"]
+            try:
+                start_time_each_image = datetime.datetime.now()
+                run_new_processing_chain(name, processed_images_dir, desert_mask_vrt)
+                interval_time = datetime.datetime.now()
+                print(f"Finished in {interval_time - start_time_each_image}")
+
+            except Exception as e:
+                print(f"Error processing {name}: {e}")
+                continue
+        with open(Processed_Sentinel_1_data_path_filename, "a", encoding="utf-8") as f:
+            f.write(processed_images_dir + os.sep + "\n")
+
+    total_time = datetime.datetime.now()
+    print(f"\n{year}-{str(month).zfill(2)}-{str(day).zfill(2)} triger finished in " +str(total_time - now))
 
 
-window_size = 10
-area_thresholds = 1000
-
-# Main program
-
-# path set up
-flood_waring_directory = os.path.join(workfolder, "ESA_flood_waring")
-os.makedirs(flood_waring_directory, exist_ok=True) 
-Sentinel_process_dir = os.path.join(workfolder, "Sentinel_1")
-os.makedirs(Sentinel_process_dir, exist_ok=True) 
-processed_images_dir = os.path.join(Sentinel_process_dir, "processed_images")
-os.makedirs(processed_images_dir, exist_ok=True)
-glofas_date_name = datetime.datetime(year, month, day).strftime("%Y%m%d")
-shapefile = os.path.join(
-    flood_waring_directory,
-    f"FloodMaskMerged{glofas_date_name}00.shp",
-)
-Processed_Sentinel_1_data_path_filename = os.path.join(
-    workfolder,
-    f"Processed_Sentinel_1_data_path_{glofas_date_name}.txt",
-)
-if os.path.exists(Processed_Sentinel_1_data_path_filename):
-    os.remove(Processed_Sentinel_1_data_path_filename)
-
-# download ESA flood warning data
-download_flood_warning_shp_from_ESA(year,month,day, flood_waring_directory)
-gdf = simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds)
-df = pd.DataFrame(columns=["Id", "Name"])
-
-# Search Sentinel-1 images with extent and date
-print("\nSearching images......", end="", flush=True)
-for idx, feature in gdf.iterrows():            
-    df = search_sentinel_with_shape_extent_and_data(df,year,month,day,feature)
-print(f"finished!")
-if not df.empty:
-    df = df.drop_duplicates(subset=["Name"]).reset_index(drop=True)
-print(f"Found {len(df)} images")
-for idx, row in df[['Id','Name']].iterrows():
-    print(f"No.{idx+1}", row['Id'], row['Name'])
-    
-# download images and process images to gamm0
-if len(df)==0:
-    print(f"No images on {glofas_date_name}")
-    # shutil.rmtree(workfolder)
-else:       
-    
-    for idx, row in df.iterrows():
-        name = row["Name"]
-        try:
-            start_time_each_image = datetime.datetime.now()
-            run_new_processing_chain(name, processed_images_dir, desert_mask_vrt)
-            interval_time = datetime.datetime.now()
-            print(f"Finished in {interval_time - start_time_each_image}")
-
-        except Exception as e:
-            print(f"Error processing {name}: {e}")
-            continue
-    with open(Processed_Sentinel_1_data_path_filename, "a", encoding="utf-8") as f:
-        f.write(processed_images_dir + os.sep + "\n")
-        
-total_time = datetime.datetime.now()
-print(f"\n{year}-{str(month).zfill(2)}-{str(day).zfill(2)} triger finished in " +str(total_time - now))
+if __name__ == "__main__":
+    main()
