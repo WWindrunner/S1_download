@@ -116,15 +116,16 @@ Warning files and intermediate rasters are saved in the work directory.
 Missing warning data or request failures stop the search with the affected date;
 they are not silently counted as zero images.
 
-The JSON result contains `ids` (UUIDs used for downloading), `count` (unique
-product count), and `images` (records with `Id` and `Name`). The same result is
+The JSON result contains `names` (product names with the trailing `.SAFE` removed)
+and `count` (product count); UUIDs are used internally for deduplication only.
+The same result is
 available from Python without triggering the processing workflow on import:
 
 ```python
 from Sentinel_1_ESA_search_download_process_chain_v4 import search_flood_images_by_date_range
 
 result = search_flood_images_by_date_range("2025-10-01", "2025-10-07", "./data")
-print(result["ids"], result["count"])
+print(result["names"], result["count"])
 ```
 
 Defaults match the daily warning workflow: raster size `1/111` degrees,
@@ -144,6 +145,12 @@ use that rectangle as their AOI; supply `geometry` for polygon matching or use
 the features returned by `simplify_flood_warning_shp_from_ESA`, which carry the
 original warning polygon in `warning_wkt`. A missing product footprint raises
 an error rather than silently accepting an unverified match.
+
+Original warning MultiPolygons are indexed by individual polygon parts once per
+day. Each retained region clips and unions only nearby parts, avoiding repeated
+global unions for large GloFAS files. The workflow logs area-selection completion,
+index construction, and each region's clipping progress and elapsed time.
+This optimization preserves the original polygons, overlap threshold and interfaces.
 
 ## Output structure
 

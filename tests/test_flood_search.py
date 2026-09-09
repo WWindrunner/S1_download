@@ -9,7 +9,10 @@ from unittest.mock import Mock
 
 import numpy as np
 import pandas as pd
-from shapely.geometry import box, Polygon, mapping, shape
+from shapely.geometry import box, Polygon, MultiPolygon, GeometryCollection, mapping, shape
+from shapely.ops import unary_union
+from shapely.strtree import STRtree
+from numbers import Integral
 from shapely.wkt import loads
 
 
@@ -21,7 +24,8 @@ class FloodSearchTests(unittest.TestCase):
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
         self.ns = dict(datetime=datetime, os=os, np=np, pd=pd, requests=Mock(),
-                       box=box, shape=shape, loads=loads, MIN_FLOOD_OVERLAP_KM2=50.0)
+                       box=box, shape=shape, loads=loads, MIN_FLOOD_OVERLAP_KM2=50.0,
+                       STRtree=STRtree, Integral=Integral, unary_union=unary_union)
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(SOURCE), "exec"), self.ns)
 
     def test_pagination_and_midnight_boundaries(self):
@@ -77,22 +81,52 @@ class FloodSearchTests(unittest.TestCase):
         self.ns["simplify_flood_warning_shp_from_ESA"] = Mock(return_value=pd.DataFrame([{"x": 1}, {"x": 2}]))
 
         def search(df, year, month, day, feature):
-            return pd.concat([df, pd.DataFrame([{"Id": str(day), "Name": f"scene-{day}"}])])
+            name = f"scene-{day}.SAFE" if day != 1 else "scene-1"
+            return pd.concat([df, pd.DataFrame([{"Id": str(day), "Name": name}])])
 
         self.ns["search_sentinel_with_shape_extent_and_data"] = search
         with tempfile.TemporaryDirectory() as directory:
             result = self.ns["search_flood_images_by_date_range"]("2024-02-28", "2024-03-01", directory)
-        self.assertEqual(result["ids"], ["28", "29", "1"])
-        self.assertEqual(result["count"], 3)
-        self.assertEqual(len(result["images"]), 3)
+        self.assertEqual(result, {"names": ["scene-28", "scene-29", "scene-1"], "count": 3})
         self.assertEqual(download.call_count, 3)
+
+    def test_indexed_clipping_matches_previous_geometry(self):
+        outer = box(0, 0, 4, 4)
+        with_hole = Polygon(outer.exterior.coords, [box(1, 1, 2, 2).exterior.coords])
+        source = [MultiPolygon([with_hole, box(100, 100, 101, 101)]),
+                  box(3, 0, 5, 3)]
+        parts, tree = self.ns["_index_warning_parts"](source)
+        for region in [box(-1, -1, 3.5, 4), box(1.1, 1.1, 1.9, 1.9),
+                       box(4, 4, 6, 6), box(50, 50, 51, 51)]:
+            expected = unary_union([g for g in source if g.intersects(region)]).intersection(region)
+            actual = self.ns["_clip_warning_parts"](parts, tree, region)
+            self.assertTrue(actual.equals(expected))
+
+    def test_global_multipolygon_unions_only_local_parts(self):
+        source = MultiPolygon([box(i * 2, 0, i * 2 + 1, 1) for i in range(1000)])
+        parts, tree = self.ns["_index_warning_parts"]([source])
+        union = self.ns["unary_union"] = Mock(wraps=unary_union)
+        result = self.ns["_clip_warning_parts"](parts, tree, box(-0.1, -0.1, 1.1, 1.1))
+        self.assertTrue(result.equals(box(0, 0, 1, 1)))
+        self.assertEqual(len(union.call_args.args[0]), 1)
+        legacy_tree = Mock()
+        legacy_tree.query.return_value = [parts[0]]
+        self.assertTrue(self.ns["_clip_warning_parts"](
+            parts, legacy_tree, box(-0.1, -0.1, 1.1, 1.1)
+        ).equals(result))
+
+    def test_empty_warning_index(self):
+        parts, tree = self.ns["_index_warning_parts"]([None, GeometryCollection()])
+        self.assertEqual(parts, [])
+        self.assertIsNone(tree)
+        self.assertTrue(self.ns["_clip_warning_parts"](parts, tree, box(0, 0, 1, 1)).is_empty)
 
     def test_empty_invalid_and_failed_searches(self):
         self.ns["download_flood_warning_shp_from_ESA"] = Mock()
         self.ns["simplify_flood_warning_shp_from_ESA"] = Mock(return_value=pd.DataFrame())
         search = self.ns["search_flood_images_by_date_range"]
         with tempfile.TemporaryDirectory() as directory:
-            self.assertEqual(search("2024-01-01", "2024-01-01", directory), {"ids": [], "count": 0, "images": []})
+            self.assertEqual(search("2024-01-01", "2024-01-01", directory), {"names": [], "count": 0})
             for start, end in [("2024-02-30", "2024-03-01"), ("2024-03-02", "2024-03-01")]:
                 with self.assertRaises(ValueError):
                     search(start, end, directory)

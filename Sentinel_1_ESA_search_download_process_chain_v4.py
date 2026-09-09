@@ -9,6 +9,9 @@ warnings.filterwarnings("ignore")
 import json
 from shapely.geometry import shape, MultiPolygon, LineString, mapping, box
 from shapely.ops import unary_union
+from shapely.strtree import STRtree
+from numbers import Integral
+from time import perf_counter
 from shapely.wkt import loads, dumps
 import xml.etree.ElementTree as ET
 import re
@@ -131,7 +134,7 @@ def simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds):
     print("finished!")
 
     # Feature area filter
-    print("4. Selecting the biggest flood area......", end="", flush=True)
+    print("4. Selecting flood regions by area......", end="", flush=True)
     gdf = gpd.read_file(f"{base_filename}_simplified_filtered.shp")
     gdf_filtered = gdf[gdf["value"] == 1]
     gdf_filtered['area_km2'] = gdf_filtered.geometry.area*110*110
@@ -145,14 +148,52 @@ def simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds):
     gdf_filtered_over_10000["maxy"] = gdf_filtered_over_10000.bounds.maxy
     # Preserve the existing expanded geometry, bounds, files and area selection.
     # Carry original warning geometry separately for precise scene filtering.
-    gdf_filtered_over_10000["warning_wkt"] = [
-        unary_union(list(original_warnings.geometry[
-            original_warnings.geometry.intersects(region)
-        ])).intersection(region).wkt
-        for region in gdf_filtered_over_10000.geometry
-    ]
-    print("finished!")
+    print(f"finished! Retained {len(gdf_filtered_over_10000)} regions.", flush=True)
+    warning_wkts = []
+    if not gdf_filtered_over_10000.empty:
+        print("5. Indexing original warning polygon parts...", flush=True)
+        started = perf_counter()
+        parts, tree = _index_warning_parts(original_warnings.geometry)
+        print(f"Indexed {len(parts)} parts in {perf_counter() - started:.1f}s.", flush=True)
+        for number, region in enumerate(gdf_filtered_over_10000.geometry, 1):
+            started = perf_counter()
+            print(f"   Clipping original warnings for region {number}/{len(gdf_filtered_over_10000)}...",
+                  flush=True)
+            warning_wkts.append(_clip_warning_parts(parts, tree, region).wkt)
+            print(f"   Finished region {number} in {perf_counter() - started:.1f}s.", flush=True)
+    gdf_filtered_over_10000["warning_wkt"] = warning_wkts
     return gdf_filtered_over_10000
+
+
+def _index_warning_parts(geometries):
+    """Index individual polygons once, even for a single global MultiPolygon."""
+    parts = []
+
+    def collect(geometry):
+        if geometry is None or geometry.is_empty:
+            return
+        if geometry.geom_type == "Polygon":
+            parts.append(geometry)
+        elif geometry.geom_type in ("MultiPolygon", "GeometryCollection"):
+            for part in geometry.geoms:
+                collect(part)
+
+    for geometry in geometries:
+        collect(geometry)
+    return parts, STRtree(parts) if parts else None
+
+
+def _clip_warning_parts(parts, tree, region):
+    """Union only local clipped parts, preserving holes and overlap semantics."""
+    clipped = []
+    if tree is not None:
+        for candidate in tree.query(region):
+            # Shapely 2 returns indices; Shapely 1 returns geometry objects.
+            part = parts[int(candidate)] if isinstance(candidate, Integral) else candidate
+            intersection = part.intersection(region)
+            if not intersection.is_empty:
+                clipped.append(intersection)
+    return unary_union(clipped)
 
 
 def _warning_geometry(feature):
@@ -228,7 +269,7 @@ def search_sentinel_with_shape_extent_and_data(df,year,month,day,feature):
 
 def search_flood_images_by_date_range(start_date, end_date, work_directory,
                                      window_size=10, area_thresholds=1000):
-    """Return unique CDSE IDs, names and count for daily warning-area SAR scenes.
+    """Return product names without .SAFE and count for daily warning-area SAR scenes.
 
     Dates are YYYY-MM-DD strings, inclusive in UTC. Each day's GloFAS mask
     selects that same day's Sentinel-1 IW_GRDH_1S acquisitions. Warning files
@@ -268,8 +309,8 @@ def search_flood_images_by_date_range(start_date, end_date, work_directory,
             raise RuntimeError(f"Flood image search failed for {current.isoformat()}: {exc}") from exc
         current += datetime.timedelta(days=1)
 
-    images = list(products.values())
-    return {"ids": list(products), "count": len(products), "images": images}
+    names = [product["Name"].removesuffix(".SAFE") for product in products.values()]
+    return {"names": names, "count": len(names)}
 
 
 def download_Sentinel_with_ids_names(ids,name,output_dir,access_token):
@@ -507,7 +548,7 @@ def main():
     parser.add_argument("--start-date", help="First UTC date, YYYY-MM-DD (inclusive).")
     parser.add_argument("--end-date", help="Last UTC date, YYYY-MM-DD (inclusive).")
     parser.add_argument("--work-directory", default=os.path.join(SCRIPT_DIR, "data"))
-    parser.add_argument("--output-json", help="Save IDs, product names and count to this JSON file.")
+    parser.add_argument("--output-json", help="Save product names without .SAFE and count to this JSON file.")
     parser.add_argument("--window-size", type=int, default=10)
     parser.add_argument("--area-thresholds", type=float, default=1000)
     args = parser.parse_args()
