@@ -153,8 +153,10 @@ and positive values identify retained regions, only on the original pre-expansio
 warning pixels. It rasterizes the existing expanded region polygons in bounded
 512-by-512 tiles; detailed original warning polygons are no longer indexed,
 clipped or unioned. Candidate scenes read only local windows from this raster,
-in bounded tiles, and can stop once the area threshold is reached. Tile progress
-and preparation time are logged. Intermediate files remain on disk as before.
+in bounded tiles, and can stop once the area threshold is reached. Only stage-level elapsed times are logged, including download/extraction,
+shapefile reading, raster processing, and catalogue search with overlap filtering.
+Each searched date ends with its unique image count, total elapsed time and
+cumulative image count; per-tile and per-region progress is omitted. Intermediate files remain on disk as before.
 
 Overlap is now a raster approximation using `all_touched=False`, consistent with
 the original warning rasterization. The existing area convention gives each

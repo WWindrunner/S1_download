@@ -4,6 +4,7 @@ import datetime
 import os
 from pathlib import Path
 import tempfile
+from time import perf_counter
 import unittest
 from unittest.mock import Mock
 
@@ -28,7 +29,7 @@ class FloodSearchTests(unittest.TestCase):
         self.ns = dict(datetime=datetime, os=os, np=np, pd=pd, requests=Mock(),
                        box=box, shape=shape, loads=loads, MIN_FLOOD_OVERLAP_KM2=50.0,
                        rasterio=rasterio, rasterize=rasterize, geometry_window=geometry_window,
-                       Window=Window, WindowError=WindowError, mapping=mapping)
+                       Window=Window, WindowError=WindowError, mapping=mapping, perf_counter=perf_counter)
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(SOURCE), "exec"), self.ns)
 
     def test_pagination_and_midnight_boundaries(self):

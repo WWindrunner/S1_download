@@ -59,18 +59,23 @@ def log_in(username,password):
     return access_token
 
 def download_flood_warning_shp_from_ESA(year,month,day, directory):
+    started = perf_counter()
+    print("Downloading and extracting GloFAS warnings...", end="", flush=True)
     glofas_date = datetime.datetime(year, month, day).strftime("%Y%m%dT00:00Z")
     url = f"https://european-flood.emergency.copernicus.eu/api/fms/download/glofas/RapidFloodMapping/{glofas_date}"
     response = requests.get(url, timeout=120)
     response.raise_for_status()
     with zipfile.ZipFile(io.BytesIO(response.content)) as z:
         z.extractall(path=directory)
-    print("GloFAS data ready. Process Flood warning data:")
+    print(f" finished in {perf_counter() - started:.1f}s.", flush=True)
 
 def simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds):
     # Rasterize
     base_filename = os.path.splitext(shapefile)[0]
+    started = perf_counter()
+    print("Reading warning shapefile...", end="", flush=True)
     gdf = gpd.read_file(shapefile)
+    print(f" finished in {perf_counter() - started:.1f}s.", flush=True)
     if gdf.empty:
         return gdf
     pixel_size = 1/111
@@ -79,6 +84,7 @@ def simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds):
     height = int((maxy - miny) / pixel_size)
     transform = from_origin(minx, maxy, pixel_size, pixel_size)
     simplified_shapes = ((geom, 1) for geom in gdf.geometry)
+    started = perf_counter()
     print("1. Rasterizing......", end="", flush=True)
     raster = rasterize(
         simplified_shapes,
@@ -101,9 +107,10 @@ def simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds):
         transform=transform
     ) as dst:
         dst.write(raster, 1)
-    print("finished!")
+    print(f"finished in {perf_counter() - started:.1f}s.", flush=True)
 
     # Window filter
+    started = perf_counter()
     print("2. Window filtering......", end="", flush=True)
     with rasterio.open(out_tif) as src:
         data = src.read(1)
@@ -112,9 +119,10 @@ def simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds):
     result = np.where(filtered == 1, 1, data)
     with rasterio.open(f"{base_filename}_simplified_filtered.tif", 'w', **profile) as dst:
         dst.write(result, 1)
-    print("finished!")
+    print(f"finished in {perf_counter() - started:.1f}s.", flush=True)
 
     # Window filter vectorize
+    started = perf_counter()
     print("3. Window filter vectorize......", end="", flush=True)
     raster_path = f"{base_filename}_simplified_filtered.tif"
     with rasterio.open(raster_path) as src:
@@ -130,9 +138,10 @@ def simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds):
         })
     gdf = gpd.GeoDataFrame(results, crs=crs)
     gdf.to_file(f"{base_filename}_simplified_filtered.shp")
-    print("finished!")
+    print(f"finished in {perf_counter() - started:.1f}s.", flush=True)
 
     # Feature area filter
+    started = perf_counter()
     print("4. Selecting flood regions by area......", end="", flush=True)
     gdf = gpd.read_file(f"{base_filename}_simplified_filtered.shp")
     gdf_filtered = gdf[gdf["value"] == 1]
@@ -145,17 +154,17 @@ def simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds):
     gdf_filtered_over_10000["miny"] = gdf_filtered_over_10000.bounds.miny
     gdf_filtered_over_10000["maxx"] = gdf_filtered_over_10000.bounds.maxx
     gdf_filtered_over_10000["maxy"] = gdf_filtered_over_10000.bounds.maxy
-    print(f"finished! Retained {len(gdf_filtered_over_10000)} regions.", flush=True)
+    print(f"finished in {perf_counter() - started:.1f}s; retained {len(gdf_filtered_over_10000)} regions.", flush=True)
     # Keep original warning pixels only, tagged by their retained expanded region.
     warning_raster = os.path.abspath(f"{base_filename}_warning_regions.tif")
     gdf_filtered_over_10000 = gdf_filtered_over_10000.copy()
     gdf_filtered_over_10000["warning_region"] = np.arange(1, len(gdf_filtered_over_10000) + 1)
     gdf_filtered_over_10000["warning_raster"] = warning_raster
     if not gdf_filtered_over_10000.empty:
-        print("5. Preparing original warning pixels by region...", flush=True)
+        print("5. Preparing original warning pixels by region...", end="", flush=True)
         started = perf_counter()
         _write_warning_region_raster(out_tif, gdf_filtered_over_10000, warning_raster)
-        print(f"Warning pixels ready in {perf_counter() - started:.1f}s.", flush=True)
+        print(f" finished in {perf_counter() - started:.1f}s.", flush=True)
     return gdf_filtered_over_10000
 
 
@@ -175,8 +184,7 @@ def _write_warning_region_raster(original_path, regions, output_path):
         profile.update(dtype="uint32", nodata=0, tiled=True, blockxsize=512,
                        blockysize=512, compress="deflate", BIGTIFF="IF_SAFER")
         with rasterio.open(output_path, "w", **profile) as dst:
-            total = ((src.width + 511) // 512) * ((src.height + 511) // 512)
-            for number, (_, window) in enumerate(dst.block_windows(1), 1):
+            for _, window in dst.block_windows(1):
                 left, bottom, right, top = src.window_bounds(window)
                 candidates = np.flatnonzero(
                     (bounds[:, 0] < right) & (bounds[:, 2] > left)
@@ -191,8 +199,6 @@ def _write_warning_region_raster(original_path, regions, output_path):
                                   all_touched=False)
                         labels[~original] = 0
                 dst.write(labels, 1, window=window)
-                if number % 100 == 0 or number == total:
-                    print(f"   Warning raster tiles: {number}/{total}", flush=True)
 
 
 def _has_raster_flood_overlap(product, feature):
@@ -330,6 +336,7 @@ def search_flood_images_by_date_range(start_date, end_date, work_directory,
     products = {}
     current = start
     while current <= end:
+        day_started = perf_counter()
         directory = os.path.join(work_directory, current.isoformat(), "ESA_flood_waring")
         os.makedirs(directory, exist_ok=True)
         print(f"Searching flood-warning images for {current.isoformat()}", flush=True)
@@ -340,12 +347,19 @@ def search_flood_images_by_date_range(start_date, end_date, work_directory,
             shapefile = os.path.join(directory, f"FloodMaskMerged{current:%Y%m%d}00.shp")
             regions = simplify_flood_warning_shp_from_ESA(shapefile, window_size, area_thresholds)
             daily = pd.DataFrame(columns=["Id", "Name"])
+            search_started = perf_counter()
+            print(f"Searching SAR catalogue and checking overlap ({len(regions)} regions)...",
+                  end="", flush=True)
             for _, feature in regions.iterrows():
                 daily = search_sentinel_with_shape_extent_and_data(
                     daily, current.year, current.month, current.day, feature
                 )
+            print(f" finished in {perf_counter() - search_started:.1f}s.", flush=True)
             for product in daily[["Id", "Name"]].to_dict("records"):
                 products.setdefault(product["Id"], product)
+            print(f"{current.isoformat()}: {daily['Id'].nunique()} unique images; "
+                  f"day total {perf_counter() - day_started:.1f}s; "
+                  f"cumulative {len(products)} images.", flush=True)
         except Exception as exc:
             raise RuntimeError(f"Flood image search failed for {current.isoformat()}: {exc}") from exc
         current += datetime.timedelta(days=1)
@@ -675,10 +689,11 @@ def main():
     df = pd.DataFrame(columns=["Id", "Name"])
 
     # Search Sentinel-1 images with extent and date
-    print("\nSearching images......", end="", flush=True)
+    search_started = perf_counter()
+    print(f"\nSearching SAR catalogue and checking overlap ({len(gdf)} regions)...", end="", flush=True)
     for idx, feature in gdf.iterrows():
         df = search_sentinel_with_shape_extent_and_data(df,year,month,day,feature)
-    print(f"finished!")
+    print(f" finished in {perf_counter() - search_started:.1f}s.", flush=True)
     if not df.empty:
         df = df.drop_duplicates(subset=["Name"]).reset_index(drop=True)
     print(f"Found {len(df)} images")
