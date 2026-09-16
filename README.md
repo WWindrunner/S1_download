@@ -182,3 +182,59 @@ Each Sentinel-1 product is written to its own subdirectory:
 The `*_DEM.tif` exported by SNAP is retained after successful completion for
 reuse and inspection. Its elevations are used as exported, without applying
 another geoid correction. Other intermediate SNAP output files are removed.
+
+## Download channel
+
+All existing commands continue to use Copernicus Data Space + SNAP by default.
+Use `--download-source cdse` to select that path explicitly, or
+`--download-source asf` for ASF HyP3 RTC. Catalogue searching remains on CDSE
+and does not require authentication. ASF authentication uses Earthdata
+`~/.netrc`, independently of the positional CDSE credentials.
+
+```bash
+# Existing invocation, unchanged:
+python Sentinel_1_specific_name_download_process.py "$SCENE" ./data "$CDSE_USERNAME" "$CDSE_PASSWORD"
+# ASF does not require the two CDSE credential arguments:
+python Sentinel_1_specific_name_download_process.py "$SCENE" ./data --download-source asf
+# Direct ASF adapter (also accepts comma-separated scene names):
+python Sentinel_1_specific_name_ASF.py "$SCENE" ./data
+# Daily warning workflow:
+python Sentinel_1_ESA_search_download_process_chain_v4.py --desert-mask-vrt /path/desert.vrt --download-source asf
+# Shell/Slurm entry points (default DOWNLOAD_SOURCE=cdse):
+DOWNLOAD_SOURCE=asf bash execute.sh
+sbatch --export=ALL,DOWNLOAD_SOURCE=asf execute_flood_warning.sh
+```
+
+Install the optional ASF dependency into the processing environment with
+`python -m pip install hyp3-sdk`. The existing SNAP environment remains usable
+without it. Configure `~/.netrc` with your Earthdata account:
+
+```text
+machine urs.earthdata.nasa.gov
+  login YOUR_EARTHDATA_USERNAME
+  password YOUR_EARTHDATA_PASSWORD
+```
+
+On Linux use `chmod 600 ~/.netrc`. ASF mode submits HyP3 RTC jobs using the
+account's available processing credits and waits for completion; each invocation
+submits new jobs. Failed jobs or incomplete VV/VH/angle/DEM packages stop that
+scene. Download/conversion intermediates are retained on failure.
+
+Both channels produce `Gamma0_VV.tif`, `Gamma0_VH.tif` and the same scene-prefixed
+`_desert.tif`, `_LIA.tif`, `_ice.tif`, `_cloud.tif` interface in the scene directory.
+ASF requests 20 m linear gamma0 RTC and reprojects layers onto a shared WGS84
+(EPSG:4326) grid at 20/111320 degrees. Gamma0 and DEM are float32 with NaN nodata.
+The DEM is retained as `<SCENE>_DEM.tif`. The ancillary mask workflow uses this
+grid. Exact grid extents and pixel values are not guaranteed to match SNAP:
+HyP3 and SNAP use different processing algorithms, and the existing SNAP path
+also applies its original ellipsoid-angle normalization, which is preserved.
+ASF gamma0 is used directly without an additional cosine correction.
+
+The [HyP3 product guide](https://hyp3-docs.asf.alaska.edu/guides/rtc_product_guide/)
+defines `_inc_map.tif` as **local incidence angle in radians**. The adapter converts
+it to degrees and writes the LIA mask directly: 0 for <=50 degrees, 1 for >50,
+255 for nodata. It must not be passed to `cal_LIA.py` as an ellipsoid angle.
+The ASF branch therefore skips that calculation; desert, snow and cloud stages
+still run. Successful workflow cleanup removes the intermediate local-angle
+raster, while retaining the DEM. The standalone ASF adapter produces the SAR,
+DEM, angle and LIA products; the full chain adds the other masks.

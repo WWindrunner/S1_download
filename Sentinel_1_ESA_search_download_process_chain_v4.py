@@ -490,15 +490,19 @@ def incidence_process(VV_VH_incidence_path):
             a=1
 
 
-def run_new_processing_chain(product_name, output_dir, desert_mask_vrt):
+def run_new_processing_chain(product_name, output_dir, desert_mask_vrt, download_source="cdse"):
     """Run the maintained per-product workflow and its ancillary masks."""
+    if download_source not in ("cdse", "asf"):
+        raise ValueError(f"Unknown download source: {download_source}")
     s1name = product_name.removesuffix(".SAFE")
     product_dir = os.path.join(output_dir, s1name)
     stages = [
         (
             "Sentinel-1 download and preprocessing",
             "Sentinel_1_specific_name_download_process.py",
-            [s1name, output_dir, username, password],
+            [s1name, output_dir,
+             *([username, password] if download_source == "cdse" else []),
+             "--download-source", download_source],
         ),
         (
             "desert mask",
@@ -514,33 +518,26 @@ def run_new_processing_chain(product_name, output_dir, desert_mask_vrt):
             check=True,
         )
 
-    incidence_paths = glob.glob(
-        os.path.join(product_dir, "*incidenceAngleFromEllipsoid.tif")
-    )
-    if len(incidence_paths) != 1:
-        raise RuntimeError(
-            "Expected exactly one ellipsoid incidence-angle raster, found "
-            f"{len(incidence_paths)}"
+    ancillary_stages = []
+    if download_source == "cdse":
+        incidence_paths = glob.glob(
+            os.path.join(product_dir, "*incidenceAngleFromEllipsoid.tif")
         )
-    ancillary_stages = [
-        (
-            "local incidence angle",
-            "cal_LIA.py",
-            [
-                s1name,
-                product_dir,
-                "--incidence-angle",
-                incidence_paths[0],
-                "--metadata-dir",
-                product_dir,
-            ],
-        ),
-        (
-            "snow and cloud masks",
-            "Snow_detect.py",
-            [s1name, os.path.join(product_dir, "Gamma0_VV.tif"), product_dir],
-        ),
-    ]
+        if len(incidence_paths) != 1:
+            raise RuntimeError(
+                "Expected exactly one ellipsoid incidence-angle raster, found "
+                f"{len(incidence_paths)}"
+            )
+        ancillary_stages.append((
+            "local incidence angle", "cal_LIA.py",
+            [s1name, product_dir, "--incidence-angle", incidence_paths[0],
+             "--metadata-dir", product_dir],
+        ))
+    # ASF already writes the same LIA exclusion-mask interface from its local angle.
+    ancillary_stages.append((
+        "snow and cloud masks", "Snow_detect.py",
+        [s1name, os.path.join(product_dir, "Gamma0_VV.tif"), product_dir],
+    ))
     for label, script_name, arguments in ancillary_stages:
         print(f"Running {label} for {s1name}...", flush=True)
         subprocess.run(
@@ -606,6 +603,7 @@ def main():
     parser.add_argument("--output-json", help="Save product names without .SAFE and count to this JSON file.")
     parser.add_argument("--window-size", type=int, default=10)
     parser.add_argument("--area-thresholds", type=float, default=1000)
+    parser.add_argument("--download-source", choices=("cdse", "asf"), default="cdse")
     args = parser.parse_args()
     if args.search_only:
         if not args.start_date or not args.end_date:
@@ -626,7 +624,7 @@ def main():
         parser.error("--desert-mask-vrt is required for processing")
     username = os.environ.get("CDSE_USERNAME", "")
     password = os.environ.get("CDSE_PASSWORD", "")
-    if not username or not password:
+    if args.download_source == "cdse" and (not username or not password):
         raise RuntimeError(
             "Set CDSE_USERNAME and CDSE_PASSWORD before running the flood-warning "
             "workflow."
@@ -710,7 +708,7 @@ def main():
             name = row["Name"]
             try:
                 start_time_each_image = datetime.datetime.now()
-                run_new_processing_chain(name, processed_images_dir, desert_mask_vrt)
+                run_new_processing_chain(name, processed_images_dir, desert_mask_vrt, args.download_source)
                 interval_time = datetime.datetime.now()
                 print(f"Finished in {interval_time - start_time_each_image}")
 

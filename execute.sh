@@ -21,11 +21,18 @@ xmax="-90.0"
 ymin="40.0"
 ymax="45.0"
 
+# Download source: cdse (default, SNAP) or asf (HyP3 RTC, Earthdata ~/.netrc).
+download_source="${DOWNLOAD_SOURCE:-cdse}"
+case "$download_source" in
+    cdse|asf) ;;
+    *) echo "Unknown download source: $download_source"; exit 1 ;;
+esac
+
 # Copernicus Data Space credentials.
 username=""
 password=""
 
-if [ -z "$username" ] || [ -z "$password" ]; then
+if [ "$download_source" = "cdse" ] && { [ -z "$username" ] || [ -z "$password" ]; }; then
     echo "Set the Copernicus Data Space username and password in execute.sh."
     exit 1
 fi
@@ -91,7 +98,8 @@ for s1name in "${s1names[@]}"; do
         "$s1name" \
         "$path" \
         "$username" \
-        "$password"; then
+        "$password" \
+        --download-source "$download_source"; then
         echo "Sentinel-1 processing failed for $s1name; intermediates retained."
         continue
     fi
@@ -101,19 +109,22 @@ for s1name in "${s1names[@]}"; do
         continue
     fi
 
-    incidence_angles=("$product_dir"/*incidenceAngleFromEllipsoid.tif)
-    if [ "${#incidence_angles[@]}" -ne 1 ]; then
-        echo "Expected exactly one incidence-angle raster for $s1name; found ${#incidence_angles[@]}."
-        continue
-    fi
+    if [ "$download_source" = "cdse" ]; then
+        incidence_angles=("$product_dir"/*incidenceAngleFromEllipsoid.tif)
+        if [ "${#incidence_angles[@]}" -ne 1 ]; then
+            echo "Expected exactly one incidence-angle raster for $s1name; found ${#incidence_angles[@]}."
+            continue
+        fi
 
-    if ! python cal_LIA.py \
-        "$s1name" \
-        "$product_dir" \
-        --incidence-angle "${incidence_angles[0]}" \
-        --metadata-dir "$product_dir"; then
-        echo "LIA processing failed for $s1name; intermediates retained."
-        continue
+        if ! python cal_LIA.py \
+            "$s1name" \
+            "$product_dir" \
+            --incidence-angle "${incidence_angles[0]}" \
+            --metadata-dir "$product_dir"; then
+            echo "LIA processing failed for $s1name; intermediates retained."
+            continue
+        fi
+
     fi
 
     if ! python Snow_detect.py \

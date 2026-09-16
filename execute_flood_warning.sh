@@ -17,8 +17,15 @@ export PATH="$SNAP_HOME/bin:$PATH"
 
 set -o pipefail
 
-: "${CDSE_USERNAME:?Export CDSE_USERNAME before submitting this job}"
-: "${CDSE_PASSWORD:?Export CDSE_PASSWORD before submitting this job}"
+download_source="${DOWNLOAD_SOURCE:-cdse}"
+case "$download_source" in
+    cdse)
+        : "${CDSE_USERNAME:?Export CDSE_USERNAME before submitting this job}"
+        : "${CDSE_PASSWORD:?Export CDSE_PASSWORD before submitting this job}"
+        ;;
+    asf) ;;
+    *) echo "Unknown download source: $download_source"; exit 1 ;;
+esac
 
 project_dir="/shared/stormcenter/zby3135/RAPID/S1_download"
 data_dir="/shared/stormcenter/zby3135/RAPID/data"
@@ -37,6 +44,6 @@ if [ ! -f "$desert_mask_vrt" ]; then
 fi
 
 cd "$project_dir" || exit 1
-python Sentinel_1_ESA_search_download_process_chain_v4.py --desert-mask-vrt "$desert_mask_vrt"
+python Sentinel_1_ESA_search_download_process_chain_v4.py --desert-mask-vrt "$desert_mask_vrt" --download-source "$download_source"
 status=$?
 exit "$status"
