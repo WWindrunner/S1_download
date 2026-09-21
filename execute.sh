@@ -4,12 +4,9 @@
 #SBATCH --mem=30G
 #SBATCH --output=/tank/data/SFS/xinyis/FS650/maopuxu/lab_2/src/download_and_process_%j.out
 
-shopt -s nullglob
-
 source /tank/data/SFS/xinyis/zhao89/software/conda/bin/activate
-conda activate s1pro
-
-cd /tank/data/SFS/xinyis/FS650/maopuxu/lab_2/src
+conda activate "${CONDA_ENV:-s1pro-rtc}" || exit 1
+cd /tank/data/SFS/xinyis/FS650/maopuxu/lab_2/src || exit 1
 
 path="/tank/data/SFS/xinyis/FS650/maopuxu/lab_2/past_events/20260616_mask"
 desert_mask_vrt="/path/to/global_desert_mask.vrt"
@@ -21,120 +18,44 @@ xmax="-90.0"
 ymin="40.0"
 ymax="45.0"
 
-# Download source: cdse (default, SNAP) or asf (HyP3 RTC, Earthdata ~/.netrc).
-download_source="${DOWNLOAD_SOURCE:-cdse}"
-case "$download_source" in
-    cdse|asf) ;;
-    *) echo "Unknown download source: $download_source"; exit 1 ;;
-esac
-
-# Copernicus Data Space credentials.
-username=""
-password=""
-
-if [ "$download_source" = "cdse" ] && { [ -z "$username" ] || [ -z "$password" ]; }; then
-    echo "Set the Copernicus Data Space username and password in execute.sh."
-    exit 1
+# Sensor/product and download provider are separate settings.
+# s1/GRD: cdse (SNAP) or asf (HyP3 RTC); nisar/GCOV: asf (existing H5).
+sensor="${SENSOR:-s1}"
+if [ "$sensor" = "nisar" ]; then
+    product_type="${PRODUCT_TYPE:-GCOV}"
+    download_source="${DOWNLOAD_SOURCE:-asf}"
+else
+    product_type="${PRODUCT_TYPE:-GRD}"
+    download_source="${DOWNLOAD_SOURCE:-cdse}"
 fi
 
-# Manual product-name input (kept as a reference):
-# s1names=(
-# "S1A_IW_GRDH_1SDV_20240301T020957_20240301T021022_052782_066322_5F93"
-# )
+# Required only for Sentinel-1 CDSE; ASF uses Earthdata ~/.netrc.
+export CDSE_USERNAME="${CDSE_USERNAME:-}"
+export CDSE_PASSWORD="${CDSE_PASSWORD:-}"
 
-search_output=$(python Sentinel_1_search_by_extent.py \
-    "$extent_file" \
-    "$start_date" \
-    "$end_date" \
-    "$xmin" \
-    "$xmax" \
-    "$ymin" \
-    "$ymax" \
-    --names-only)
-search_status=$?
+# Set exact product names to bypass spatial/time searching.
+product_names=()
+# product_names=("S1A_IW_GRDH_1SDV_20240301T020957_20240301T021022_052782_066322_5F93")
+# product_names=("NISAR_L2_PR_GCOV_024_156_D_069_2005_QPDH_A_20260707T004257_20260707T004331_P05023_N_F_J_001")
 
-if [ "$search_status" -ne 0 ]; then
-    echo "Sentinel-1 image search failed."
-    exit "$search_status"
+args=(--sensor "$sensor" --product-type "$product_type"
+      --download-source "$download_source" --output-dir "$path"
+      --desert-mask-vrt "$desert_mask_vrt")
+if [ "${#product_names[@]}" -gt 0 ]; then
+    args+=(--names "${product_names[@]}")
+else
+    args+=(--start-date "$start_date" --end-date "$end_date")
+    if [ -f "$extent_file" ]; then
+        args+=(--extent-file "$extent_file")
+    else
+        args+=(--bbox "$xmin" "$ymin" "$xmax" "$ymax")
+    fi
+fi
+if [ "$sensor" = "nisar" ]; then
+    # auto preserves source-derived WGS84 spacing; 20/30 are nominal metres.
+    args+=(--resolution "${RESOLUTION:-auto}" --frequency "${FREQUENCY:-A}")
 fi
 
-if [ -z "$search_output" ]; then
-    echo "No Sentinel-1 images found for the specified extent and date range."
-    exit 0
-fi
-
-mapfile -t s1names <<< "$search_output"
-echo "Found ${#s1names[@]} Sentinel-1 images."
-printf '  %s\n' "${s1names[@]}"
-
-cleanup_product_intermediates() {
-    # Keep *_DEM.tif exported by SNAP for LIA reuse and inspection.
-    local product_dir="$path/$1"
-
-    if [ ! -d "$product_dir" ]; then
-        echo "Cleanup skipped: product directory not found: $product_dir"
-        return
-    fi
-
-    rm -rf -- \
-        "$product_dir/snow_temp" \
-        "$product_dir/dem_tiles"
-    rm -f -- \
-        "$product_dir"/*.zip \
-        "$product_dir"/*incidenceAngleFromEllipsoid.tif \
-        "$product_dir"/*localIncidenceAngle.tif \
-        "$product_dir"/*_manifest.safe \
-        "$product_dir"/*_proc.xml \
-        "$product_dir"/*_gamma0-rtc.tif \
-        "$product_dir"/DEM_merged.tif \
-        "$product_dir"/DEM_merged_res.tif
-}
-
-for s1name in "${s1names[@]}"; do
-    echo "Processing $s1name"
-    product_dir="$path/$s1name"
-
-    if ! python Sentinel_1_specific_name_download_process.py \
-        "$s1name" \
-        "$path" \
-        "$username" \
-        "$password" \
-        --download-source "$download_source"; then
-        echo "Sentinel-1 processing failed for $s1name; intermediates retained."
-        continue
-    fi
-
-    if ! python Desert_mask.py "$s1name" "$path" "$desert_mask_vrt"; then
-        echo "Desert-mask processing failed for $s1name; intermediates retained."
-        continue
-    fi
-
-    if [ "$download_source" = "cdse" ]; then
-        incidence_angles=("$product_dir"/*incidenceAngleFromEllipsoid.tif)
-        if [ "${#incidence_angles[@]}" -ne 1 ]; then
-            echo "Expected exactly one incidence-angle raster for $s1name; found ${#incidence_angles[@]}."
-            continue
-        fi
-
-        if ! python cal_LIA.py \
-            "$s1name" \
-            "$product_dir" \
-            --incidence-angle "${incidence_angles[0]}" \
-            --metadata-dir "$product_dir"; then
-            echo "LIA processing failed for $s1name; intermediates retained."
-            continue
-        fi
-
-    fi
-
-    if ! python Snow_detect.py \
-        "$s1name" \
-        "$product_dir/Gamma0_VV.tif" \
-        "$product_dir"; then
-        echo "Snow/cloud processing failed for $s1name; intermediates retained."
-        continue
-    fi
-
-    cleanup_product_intermediates "$s1name"
-    echo "Completed and cleaned intermediate files for $s1name."
-done
+# Extra CLI switches may be passed to bash/sbatch (e.g. --search-only or --force).
+python SAR_download_process.py "${args[@]}" "$@"
+exit $?

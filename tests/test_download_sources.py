@@ -130,6 +130,30 @@ class DownloadTests(unittest.TestCase):
                 self.assertIn("Snow_detect.py", scripts)
                 self.assertTrue((scene / "scene_DEM.tif").exists())
 
+    def test_daily_nisar_adapter_uses_gcov_chain_and_retains_inputs(self):
+        tree = ast.parse((ROOT / "Sentinel_1_ESA_search_download_process_chain_v4.py").read_text(encoding="utf-8"))
+        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_new_processing_chain")
+        runner = Mock()
+        ns = dict(os=os, sys=sys, subprocess=runner, SCRIPT_DIR=str(ROOT))
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "chain", "exec"), ns)
+        with tempfile.TemporaryDirectory() as directory:
+            name = "NISAR_L2_PR_GCOV_TEST"
+            scene = Path(directory) / name
+            scene.mkdir()
+            original = scene / (name + ".h5")
+            original.touch()
+            # Omitted download_source selects ASF; no CDSE credential globals are needed.
+            ns["run_new_processing_chain"](name, directory, "desert.vrt", sensor="nisar")
+            command = runner.run.call_args.args[0]
+            self.assertEqual(Path(command[1]).name, "NISAR_specific_name_download_process.py")
+            self.assertEqual(command[2:], ["--names", name, "--output-dir", directory,
+                                          "--desert-mask-vrt", "desert.vrt", "--download-source", "asf"])
+            self.assertTrue(runner.run.call_args.kwargs["check"])
+            self.assertTrue(original.exists())
+            with self.assertRaises(ValueError):
+                ns["run_new_processing_chain"](name, directory, "desert.vrt", "cdse", sensor="nisar")
+            runner.run.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

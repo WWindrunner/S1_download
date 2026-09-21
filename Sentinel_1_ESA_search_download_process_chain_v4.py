@@ -314,16 +314,48 @@ def search_sentinel_with_shape_extent_and_data(df,year,month,day,feature):
     return df
 
 
+def search_nisar_with_shape_extent_and_data(df, year, month, day, feature):
+    """Search GCOV with the same daily warning-pixel overlap rule as Sentinel-1."""
+    from NISAR_extent_time_download import search_nisar, product_name
+
+    use_raster = bool(feature.get("warning_raster"))
+    warning_geometry = None if use_raster else _warning_geometry(feature)
+    if not use_raster and warning_geometry.is_empty:
+        return df
+    polygon = box(feature["minx"], feature["miny"], feature["maxx"], feature["maxy"])
+    date = datetime.date(year, month, day).isoformat()
+    candidates = search_nisar(date, date, polygon.wkt)
+    accepted = []
+    for candidate in candidates:
+        name = product_name(candidate)
+        footprint = candidate.geojson().get("geometry")
+        if not footprint:
+            raise ValueError(f"Missing footprint for NISAR product {name}")
+        # Adapt ASF geometry to the existing overlap helpers; keep one stable ID per granule.
+        product = {"Id": name, "Name": name, "GeoFootprint": footprint}
+        if (_has_raster_flood_overlap(product, feature) if use_raster
+                else _has_flood_overlap(product, warning_geometry)):
+            accepted.append(product)
+    if accepted:
+        df = pd.concat([df, pd.DataFrame(accepted)], ignore_index=True)
+    return df
+
+
 def search_flood_images_by_date_range(start_date, end_date, work_directory,
-                                     window_size=10, area_thresholds=1000):
+                                     window_size=10, area_thresholds=1000, sensor="s1"):
     """Return product names without .SAFE and count for daily warning-area SAR scenes.
 
     Dates are YYYY-MM-DD strings, inclusive in UTC. Each day's GloFAS mask
-    selects that same day's Sentinel-1 IW_GRDH_1S acquisitions. Warning files
+    selects that same day's Sentinel-1 IW_GRDH_1S acquisitions by default, or
+    NISAR GCOV when sensor="nisar". Existing positional arguments are unchanged. Warning files
     and intermediate masks are saved under work_directory; SAR is not downloaded.
     Any missing warning archive or failed catalogue request raises an exception
     rather than returning an incomplete count as a successful result.
     """
+    if sensor not in ("s1", "nisar"):
+        raise ValueError(f"Unknown sensor: {sensor}")
+    search = (search_sentinel_with_shape_extent_and_data if sensor == "s1"
+              else search_nisar_with_shape_extent_and_data)
     start = datetime.date.fromisoformat(start_date)
     end = datetime.date.fromisoformat(end_date)
     if start > end:
@@ -351,7 +383,7 @@ def search_flood_images_by_date_range(start_date, end_date, work_directory,
             print(f"Searching SAR catalogue and checking overlap ({len(regions)} regions)...",
                   end="", flush=True)
             for _, feature in regions.iterrows():
-                daily = search_sentinel_with_shape_extent_and_data(
+                daily = search(
                     daily, current.year, current.month, current.day, feature
                 )
             print(f" finished in {perf_counter() - search_started:.1f}s.", flush=True)
@@ -490,10 +522,25 @@ def incidence_process(VV_VH_incidence_path):
             a=1
 
 
-def run_new_processing_chain(product_name, output_dir, desert_mask_vrt, download_source="cdse"):
+def run_new_processing_chain(product_name, output_dir, desert_mask_vrt, download_source=None, sensor="s1"):
     """Run the maintained per-product workflow and its ancillary masks."""
+    if sensor not in ("s1", "nisar"):
+        raise ValueError(f"Unknown sensor: {sensor}")
+    if download_source is None:
+        download_source = "asf" if sensor == "nisar" else "cdse"
     if download_source not in ("cdse", "asf"):
         raise ValueError(f"Unknown download source: {download_source}")
+    if sensor == "nisar":
+        if download_source != "asf":
+            raise ValueError("NISAR GCOV requires download_source='asf'")
+        subprocess.run(
+            [sys.executable, os.path.join(SCRIPT_DIR, "NISAR_specific_name_download_process.py"),
+             "--names", product_name, "--output-dir", output_dir,
+             "--desert-mask-vrt", desert_mask_vrt, "--download-source", download_source],
+            check=True,
+        )
+        # NISAR retains H5, DEM and angles for checkpoints; do not run S1 cleanup.
+        return
     s1name = product_name.removesuffix(".SAFE")
     product_dir = os.path.join(output_dir, s1name)
     stages = [
@@ -561,7 +608,7 @@ def run_new_processing_chain(product_name, output_dir, desert_mask_vrt, download
     if missing:
         raise RuntimeError("Missing expected outputs: " + ", ".join(missing))
 
-    # Match execute.sh: only clean intermediates after every stage succeeds.
+    # Preserve the legacy Sentinel-1 daily cleanup after every stage succeeds.
     for directory_name in ("snow_temp", "dem_tiles"):
         shutil.rmtree(os.path.join(product_dir, directory_name), ignore_errors=True)
     # Keep *_DEM.tif exported by SNAP for LIA reuse and inspection.
@@ -590,7 +637,7 @@ def run_new_processing_chain(product_name, output_dir, desert_mask_vrt, download
 def main():
     global username, password
     parser = argparse.ArgumentParser(
-        description="Process today's GloFAS flood warnings with Sentinel-1 data."
+        description="Process today's GloFAS flood warnings with Sentinel-1 (default) or NISAR GCOV."
     )
     parser.add_argument(
         "--desert-mask-vrt",
@@ -603,14 +650,20 @@ def main():
     parser.add_argument("--output-json", help="Save product names without .SAFE and count to this JSON file.")
     parser.add_argument("--window-size", type=int, default=10)
     parser.add_argument("--area-thresholds", type=float, default=1000)
-    parser.add_argument("--download-source", choices=("cdse", "asf"), default="cdse")
+    parser.add_argument("--sensor", choices=("s1", "nisar"), default="s1")
+    parser.add_argument("--download-source", choices=("cdse", "asf"), default=None,
+                        help="Default: cdse for Sentinel-1, asf for NISAR.")
     args = parser.parse_args()
+    args.download_source = args.download_source or ("asf" if args.sensor == "nisar" else "cdse")
+    if args.sensor == "nisar" and args.download_source != "asf":
+        parser.error("NISAR GCOV requires --download-source asf")
     if args.search_only:
         if not args.start_date or not args.end_date:
             parser.error("--search-only requires --start-date and --end-date")
         result = search_flood_images_by_date_range(
             args.start_date, args.end_date, args.work_directory,
             window_size=args.window_size, area_thresholds=args.area_thresholds,
+            sensor=args.sensor,
         )
         output = json.dumps(result, indent=2)
         if args.output_json:
@@ -665,7 +718,8 @@ def main():
     # path set up
     flood_waring_directory = os.path.join(workfolder, "ESA_flood_waring")
     os.makedirs(flood_waring_directory, exist_ok=True)
-    Sentinel_process_dir = os.path.join(workfolder, "Sentinel_1")
+    sensor_label = "Sentinel_1" if args.sensor == "s1" else "NISAR"
+    Sentinel_process_dir = os.path.join(workfolder, sensor_label)
     os.makedirs(Sentinel_process_dir, exist_ok=True)
     processed_images_dir = os.path.join(Sentinel_process_dir, "processed_images")
     os.makedirs(processed_images_dir, exist_ok=True)
@@ -676,7 +730,7 @@ def main():
     )
     Processed_Sentinel_1_data_path_filename = os.path.join(
         workfolder,
-        f"Processed_Sentinel_1_data_path_{glofas_date_name}.txt",
+        f"Processed_{sensor_label}_data_path_{glofas_date_name}.txt",
     )
     if os.path.exists(Processed_Sentinel_1_data_path_filename):
         os.remove(Processed_Sentinel_1_data_path_filename)
@@ -686,11 +740,13 @@ def main():
     gdf = simplify_flood_warning_shp_from_ESA(shapefile,window_size,area_thresholds)
     df = pd.DataFrame(columns=["Id", "Name"])
 
-    # Search Sentinel-1 images with extent and date
+    # Keep the existing daily date and warning-area selection for both sensors.
+    search = (search_sentinel_with_shape_extent_and_data if args.sensor == "s1"
+              else search_nisar_with_shape_extent_and_data)
     search_started = perf_counter()
     print(f"\nSearching SAR catalogue and checking overlap ({len(gdf)} regions)...", end="", flush=True)
     for idx, feature in gdf.iterrows():
-        df = search_sentinel_with_shape_extent_and_data(df,year,month,day,feature)
+        df = search(df,year,month,day,feature)
     print(f" finished in {perf_counter() - search_started:.1f}s.", flush=True)
     if not df.empty:
         df = df.drop_duplicates(subset=["Name"]).reset_index(drop=True)
@@ -699,6 +755,7 @@ def main():
         print(f"No.{idx+1}", row['Id'], row['Name'])
 
     # download images and process images to gamm0
+    failures = 0
     if len(df)==0:
         print(f"No images on {glofas_date_name}")
         # shutil.rmtree(workfolder)
@@ -708,19 +765,28 @@ def main():
             name = row["Name"]
             try:
                 start_time_each_image = datetime.datetime.now()
-                run_new_processing_chain(name, processed_images_dir, desert_mask_vrt, args.download_source)
+                if args.sensor == "s1":
+                    run_new_processing_chain(name, processed_images_dir, desert_mask_vrt, args.download_source)
+                else:
+                    run_new_processing_chain(name, processed_images_dir, desert_mask_vrt,
+                                             args.download_source, sensor="nisar")
                 interval_time = datetime.datetime.now()
                 print(f"Finished in {interval_time - start_time_each_image}")
 
             except Exception as e:
                 print(f"Error processing {name}: {e}")
+                failures += 1
                 continue
-        with open(Processed_Sentinel_1_data_path_filename, "a", encoding="utf-8") as f:
-            f.write(processed_images_dir + os.sep + "\n")
+        if args.sensor == "s1" or failures < len(df):
+            with open(Processed_Sentinel_1_data_path_filename, "a", encoding="utf-8") as f:
+                f.write(processed_images_dir + os.sep + "\n")
 
     total_time = datetime.datetime.now()
     print(f"\n{year}-{str(month).zfill(2)}-{str(day).zfill(2)} triger finished in " +str(total_time - now))
+    # Preserve Sentinel-1 exit behavior; new NISAR jobs report partial failures.
+    if args.sensor == "nisar":
+        return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,12 +1,17 @@
 """Exercise search logic without requiring SNAP/GDAL or external services."""
 import ast
+import argparse
+import contextlib
 import datetime
+import io
+import json
 import os
 from pathlib import Path
 import tempfile
+import sys
 from time import perf_counter
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
@@ -185,6 +190,123 @@ class FloodSearchTests(unittest.TestCase):
             self.ns["download_flood_warning_shp_from_ESA"].side_effect = OSError("unavailable")
             with self.assertRaisesRegex(RuntimeError, "2024-01-01"):
                 search("2024-01-01", "2024-01-02", directory)
+
+    def test_nisar_search_uses_original_pixels_and_same_overlap_threshold(self):
+        import NISAR_extent_time_download as nisar
+
+        footprint = box(0, 0, 20 / 111, 20 / 111)
+        candidate = Mock(properties={"sceneName": "NISAR_L2_PR_GCOV_TEST"})
+        candidate.geojson.return_value = {"geometry": mapping(footprint)}
+        rejected = Mock(properties={"sceneName": "NISAR_L2_PR_GCOV_OUTSIDE"})
+        rejected.geojson.return_value = {"geometry": mapping(box(10, 10, 11, 11))}
+        self.ns["_warning_geometry"] = Mock(side_effect=AssertionError("must use original pixels"))
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                nisar, "search_nisar", return_value=[candidate, rejected]) as query:
+            path = os.path.join(directory, "labels.tif")
+            feature = dict(minx=0, miny=0, maxx=20/111, maxy=20/111,
+                           warning_raster=path, warning_region=1)
+            for count, expected in ((50, []), (51, ["NISAR_L2_PR_GCOV_TEST"])):
+                labels = np.zeros((20, 20), dtype="uint32")
+                labels.flat[:count] = 1
+                self.write_raster(path, labels, from_origin(0, 20/111, 1/111, 1/111))
+                results = self.ns["search_nisar_with_shape_extent_and_data"](
+                    pd.DataFrame(columns=["Id", "Name"]), 2026, 7, 7, feature)
+                self.assertEqual(results.Name.tolist(), expected)
+            self.assertEqual(query.call_args.args[:2], ("2026-07-07", "2026-07-07"))
+            self.assertTrue(loads(query.call_args.args[2]).equals_exact(footprint, 1e-12))
+            candidate.geojson.return_value = {"geometry": None}
+            with self.assertRaisesRegex(ValueError, "Missing footprint"):
+                self.ns["search_nisar_with_shape_extent_and_data"](
+                    pd.DataFrame(columns=["Id", "Name"]), 2026, 7, 7, feature)
+        self.ns["requests"].get.assert_not_called()
+
+    def test_nisar_date_range_keeps_schema_and_deduplicates_regions_and_days(self):
+        import NISAR_extent_time_download as nisar
+
+        self.ns["download_flood_warning_shp_from_ESA"] = Mock()
+        region = dict(minx=0, miny=0, maxx=1, maxy=1, geometry=box(0, 0, 1, 1))
+        self.ns["simplify_flood_warning_shp_from_ESA"] = Mock(return_value=pd.DataFrame([region, region]))
+        candidate = Mock(properties={"sceneName": "NISAR_L2_PR_GCOV_TEST"})
+        candidate.geojson.return_value = {"geometry": mapping(box(0, 0, 1, 1))}
+        self.ns["search_sentinel_with_shape_extent_and_data"] = Mock(side_effect=AssertionError("unexpected CDSE search"))
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                nisar, "search_nisar", return_value=[candidate]) as query:
+            result = self.ns["search_flood_images_by_date_range"](
+                "2026-07-07", "2026-07-08", directory, 10, 1000, sensor="nisar")
+        self.assertEqual(result, {"names": ["NISAR_L2_PR_GCOV_TEST"], "count": 1})
+        self.assertEqual(query.call_count, 4)
+        self.assertEqual(query.call_args.args[:2], ("2026-07-08", "2026-07-08"))
+
+    def configure_daily_main(self):
+        self.ns.update(argparse=argparse, json=json, sys=sys, SCRIPT_DIR=str(SOURCE.parent))
+        self.ns["download_flood_warning_shp_from_ESA"] = Mock()
+        self.ns["simplify_flood_warning_shp_from_ESA"] = Mock(return_value=pd.DataFrame([{"region": 1}]))
+        self.ns["run_new_processing_chain"] = Mock()
+
+    def test_daily_main_default_and_nisar_routing_preserve_legacy_layout(self):
+        for sensor in ("s1", "nisar"):
+            with self.subTest(sensor=sensor), tempfile.TemporaryDirectory() as directory:
+                self.configure_daily_main()
+                name = "scene.SAFE" if sensor == "s1" else "NISAR_L2_PR_GCOV_TEST"
+                data = pd.DataFrame([dict(Id="a", Name=name), dict(Id="a", Name=name)])
+                s1 = self.ns["search_sentinel_with_shape_extent_and_data"] = Mock(return_value=data)
+                nisar = self.ns["search_nisar_with_shape_extent_and_data"] = Mock(return_value=data)
+                vrt = Path(directory) / "desert.vrt"
+                vrt.touch()
+                env = dict(RAPID_PROJECT_DIR=directory)
+                argv = [str(SOURCE), "--desert-mask-vrt", str(vrt)]
+                if sensor == "s1":
+                    env.update(CDSE_USERNAME="user", CDSE_PASSWORD="password")
+                else:
+                    argv += ["--sensor", "nisar"]
+                with patch.dict(os.environ, env, clear=True), patch.object(sys, "argv", argv):
+                    self.assertEqual(self.ns["main"](), None if sensor == "s1" else 0)
+                selected, other = (s1, nisar) if sensor == "s1" else (nisar, s1)
+                selected.assert_called_once()
+                other.assert_not_called()
+                label = "Sentinel_1" if sensor == "s1" else "NISAR"
+                now = datetime.datetime.now()
+                day_root = Path(directory) / "data" / now.strftime("%Y-%m-%d")
+                output = day_root / label / "processed_images"
+                manifest = day_root / f"Processed_{label}_data_path_{now:%Y%m%d}.txt"
+                self.assertEqual(manifest.read_text().strip(), str(output) + os.sep)
+                process = self.ns["run_new_processing_chain"]
+                if sensor == "s1":
+                    process.assert_called_once_with(name, str(output), str(vrt), "cdse")
+                else:
+                    process.assert_called_once_with(name, str(output), str(vrt), "asf", sensor="nisar")
+                    self.assertFalse((day_root / "Sentinel_1").exists())
+                    self.assertEqual(self.ns["username"], "")
+
+    def test_nisar_daily_failure_does_not_publish_success_path(self):
+        self.configure_daily_main()
+        self.ns["search_nisar_with_shape_extent_and_data"] = Mock(
+            return_value=pd.DataFrame([dict(Id="a", Name="NISAR_L2_PR_GCOV_TEST")]))
+        self.ns["run_new_processing_chain"].side_effect = RuntimeError("download failed")
+        with tempfile.TemporaryDirectory() as directory:
+            vrt = Path(directory) / "desert.vrt"
+            vrt.touch()
+            with patch.dict(os.environ, dict(RAPID_PROJECT_DIR=directory), clear=True), patch.object(
+                    sys, "argv", [str(SOURCE), "--sensor", "nisar", "--desert-mask-vrt", str(vrt)]):
+                self.assertEqual(self.ns["main"](), 1)
+            self.assertEqual(list(Path(directory).rglob("Processed_NISAR_data_path_*.txt")), [])
+
+    def test_nisar_search_only_needs_no_credentials_or_desert_vrt(self):
+        self.configure_daily_main()
+        search = self.ns["search_flood_images_by_date_range"] = Mock(return_value={"names": [], "count": 0})
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
+            argv = [str(SOURCE), "--sensor", "nisar", "--search-only", "--start-date", "2026-07-07",
+                    "--end-date", "2026-07-08", "--work-directory", directory]
+            with patch.object(sys, "argv", argv):
+                self.ns["main"]()
+            search.assert_called_once_with("2026-07-07", "2026-07-08", directory,
+                                           window_size=10, area_thresholds=1000, sensor="nisar")
+            self.ns["run_new_processing_chain"].assert_not_called()
+            search.reset_mock()
+            with (patch.object(sys, "argv", argv + ["--download-source", "cdse"]),
+                  contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit)):
+                self.ns["main"]()
+            search.assert_not_called()
 
 
 if __name__ == "__main__":

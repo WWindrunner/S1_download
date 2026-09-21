@@ -17,7 +17,18 @@ export PATH="$SNAP_HOME/bin:$PATH"
 
 set -o pipefail
 
-download_source="${DOWNLOAD_SOURCE:-cdse}"
+sensor="${SENSOR:-s1}"
+case "$sensor" in
+    s1) download_source="${DOWNLOAD_SOURCE:-cdse}" ;;
+    nisar)
+        download_source="${DOWNLOAD_SOURCE:-asf}"
+        if [ "$download_source" != "asf" ]; then
+            echo "NISAR GCOV requires DOWNLOAD_SOURCE=asf."
+            exit 1
+        fi
+        ;;
+    *) echo "Unknown sensor: $sensor"; exit 1 ;;
+esac
 case "$download_source" in
     cdse)
         : "${CDSE_USERNAME:?Export CDSE_USERNAME before submitting this job}"
@@ -44,6 +55,6 @@ if [ ! -f "$desert_mask_vrt" ]; then
 fi
 
 cd "$project_dir" || exit 1
-python Sentinel_1_ESA_search_download_process_chain_v4.py --desert-mask-vrt "$desert_mask_vrt" --download-source "$download_source"
+python Sentinel_1_ESA_search_download_process_chain_v4.py --desert-mask-vrt "$desert_mask_vrt" --download-source "$download_source" --sensor "$sensor"
 status=$?
 exit "$status"

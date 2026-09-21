@@ -1,35 +1,47 @@
-name: s1pro
+name: s1pro-rtc
 
 channels:
   - conda-forge
+  - nodefaults
 
-# Only direct dependencies imported by this project's Python scripts are listed
-# here. Conda resolves transitive libraries (PROJ, GEOS, HDF5, etc.) itself.
+# Direct dependencies plus spatialist, whose run() interface is used by pyroSAR.
+# Versions passed imports and SNAP node parsing on Linux with SNAP 12.
+# Full-scene processing has not yet been validated with this environment.
+# Conda resolves transitive libraries (PROJ, GEOS, HDF5, etc.) itself.
 dependencies:
   - python=3.12
 
   # Core numerical and data handling
-  - numpy=1.26
-  - pandas
-  - scipy
+  - numpy=1.26.4
+  - pandas=2.2.3
+  - scipy=1.17.1
+  - h5py
 
   # Geospatial stack: keep these in conda-forge to avoid binary ABI conflicts
-  - gdal
-  - geopandas
-  - rasterio
-  - shapely
-  - matplotlib
+  - gdal=3.10.3
+  - geopandas=1.1.4
+  - rasterio=1.4.4
+  - pyproj
+  - shapely=2.1.2
+  - matplotlib=3.11.1
 
   # Sentinel-1 processing and catalogue access
-  - pyrosar
-  - eodag
-  - planetary-computer
-  - pystac-client
+  - pyrosar=0.34.5
+  - spatialist=0.17.1
+  - eodag=4.7.2
+  - planetary-computer=1.0.0
+  - pystac-client=0.9.0
 
   # HTTP downloads and command-line progress
-  - requests
-  - tqdm
-  - wget
+  - requests=2.32.4
+  - tqdm=4.67.1
+  - python-wget=3.2
+  - pip
+  - pip:
+      # ASF catalogue/Earthdata downloads, including NISAR.
+      - asf-search>=10.0.0
+      # Sentinel-1 ASF HyP3 RTC adapter.
+      - hyp3-sdk
 
 # ESA SNAP (including the `gpt` executable) is an external application used by
 # pyroSAR. Install SNAP separately and ensure its bin directory is on PATH.

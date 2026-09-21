@@ -1,136 +1,65 @@
-import os
+"""Align an external categorical desert mask to a SAR reference grid."""
+import argparse
+from pathlib import Path
 import sys
 import time
-import traceback
 
-from osgeo import gdal
+import numpy as np
+import rasterio
+from rasterio.vrt import WarpedVRT
+from rasterio.warp import Resampling
 
-
-gdal.UseExceptions()
-start_time = time.perf_counter()
-
-
-if len(sys.argv) != 4:
-    print(
-        "Usage: python Desert_mask.py "
-        "<S1_PRODUCT_NAME> <OUTPUT_FOLDER> <DESERT_MASK_VRT>"
-    )
-    sys.exit(1)
-
-S1name = sys.argv[1]
-folder = os.path.abspath(os.path.expanduser(sys.argv[2]))
-desert_mask_vrt = os.path.abspath(os.path.expanduser(sys.argv[3]))
-product_dir = os.path.join(folder, S1name)
-
-if not os.path.isdir(product_dir):
-    raise FileNotFoundError(f"S1 product folder not found: {product_dir}")
-
-reference_path = os.path.join(product_dir, "Gamma0_VV.tif")
-if not os.path.isfile(reference_path):
-    raise FileNotFoundError(f"Reference raster not found: {reference_path}")
-
-output_path = os.path.join(product_dir, f"{S1name}_desert.tif")
+from nisar_common import raster_profile, validate_raster
 
 
-def create_nodata_desert_raster(reference_ds):
-    driver = gdal.GetDriverByName("GTiff")
-    output_ds = driver.Create(
-        output_path,
-        reference_ds.RasterXSize,
-        reference_ds.RasterYSize,
-        1,
-        gdal.GDT_Float32,
-        options=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"],
-    )
-    if output_ds is None:
-        raise RuntimeError(f"Failed to create empty desert mask: {output_path}")
-    output_ds.SetGeoTransform(reference_ds.GetGeoTransform())
-    output_ds.SetProjection(reference_ds.GetProjection())
-    band = output_ds.GetRasterBand(1)
-    band.SetNoDataValue(-9999)
-    band.Fill(-9999)
-    band.FlushCache()
-    output_ds = None
+def generate_desert_mask(product_name, reference_path, output_dir, desert_mask_vrt, strict=False):
+    started = time.perf_counter()
+    output = Path(output_dir) / f"{product_name}_desert.tif"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial = output.with_name(output.name + ".part")
+    with rasterio.open(reference_path) as reference:
+        if reference.crs is None or reference.transform.b != 0 or reference.transform.d != 0:
+            raise ValueError("Reference must have a CRS and an unrotated grid")
+        try:
+            with rasterio.open(desert_mask_vrt) as source:
+                if source.count != 1 or source.crs is None:
+                    raise ValueError("Desert source must be single-band with a CRS")
+                nodata = source.nodata if source.nodata is not None else -9999
+                profile = raster_profile(reference, nodata=nodata)
+                with WarpedVRT(source, crs=reference.crs, transform=reference.transform,
+                               width=reference.width, height=reference.height, dtype="float32",
+                               nodata=nodata, resampling=Resampling.nearest) as aligned, rasterio.open(
+                                   partial, "w", **profile) as dst:
+                    for _, window in dst.block_windows(1):
+                        values = aligned.read(1, window=window, masked=True).filled(nodata)
+                        valid = np.isfinite(reference.read(1, window=window, masked=True).filled(np.nan))
+                        values[~valid] = nodata
+                        dst.write(values, 1, window=window)
+        except Exception:
+            if strict:
+                raise
+            print("Desert mask failed; creating the legacy all-nodata fallback.", file=sys.stderr)
+            with rasterio.open(partial, "w", **raster_profile(reference, nodata=-9999)) as dst:
+                for _, window in dst.block_windows(1):
+                    dst.write(np.full((int(window.height), int(window.width)), -9999, dtype="float32"), 1, window=window)
+    validate_raster(partial, reference_path, require_valid=False)
+    partial.replace(output)
+    print(f"Desert mask completed in {time.perf_counter() - started:.2f} seconds.")
+    return str(output)
 
 
-# The reference raster defines the output grid and fallback raster.
-reference_ds = gdal.Open(reference_path)
-if reference_ds is None:
-    raise RuntimeError(f"Failed to open reference raster: {reference_path}")
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("product_name")
+    parser.add_argument("output_folder")
+    parser.add_argument("desert_mask_vrt")
+    parser.add_argument("--reference-raster", help="Default: <OUTPUT_FOLDER>/<PRODUCT>/Gamma0_VV.tif")
+    parser.add_argument("--strict", action="store_true", help="Stop on source errors instead of writing a nodata fallback")
+    args = parser.parse_args(argv)
+    directory = Path(args.output_folder).expanduser().resolve() / args.product_name
+    reference = args.reference_raster or directory / "Gamma0_VV.tif"
+    generate_desert_mask(args.product_name, reference, directory, args.desert_mask_vrt, args.strict)
 
-try:
-    if not os.path.isfile(desert_mask_vrt):
-        raise FileNotFoundError(f"Desert mask VRT not found: {desert_mask_vrt}")
 
-    reference_gt = reference_ds.GetGeoTransform()
-    reference_projection = reference_ds.GetProjection()
-    reference_cols = reference_ds.RasterXSize
-    reference_rows = reference_ds.RasterYSize
-
-    if not reference_projection:
-        raise ValueError(f"Reference raster has no CRS: {reference_path}")
-
-    if reference_gt[2] != 0 or reference_gt[4] != 0:
-        raise ValueError("Rotated reference rasters are not supported")
-
-    x_end = reference_gt[0] + reference_cols * reference_gt[1]
-    y_end = reference_gt[3] + reference_rows * reference_gt[5]
-    reference_bounds = [
-        min(reference_gt[0], x_end),
-        min(reference_gt[3], y_end),
-        max(reference_gt[0], x_end),
-        max(reference_gt[3], y_end),
-    ]
-
-    desert_ds = gdal.Open(desert_mask_vrt)
-    if desert_ds is None:
-        raise RuntimeError(f"Failed to open desert mask: {desert_mask_vrt}")
-    if desert_ds.RasterCount != 1:
-        raise ValueError(
-            "Desert mask must contain exactly one band, "
-            f"found {desert_ds.RasterCount}"
-        )
-
-    source_nodata = desert_ds.GetRasterBand(1).GetNoDataValue()
-    warp_kwargs = {
-        "format": "GTiff",
-        "dstSRS": reference_projection,
-        "outputBounds": reference_bounds,
-        "width": reference_cols,
-        "height": reference_rows,
-        "resampleAlg": gdal.GRA_NearestNeighbour,
-        "multithread": True,
-        "creationOptions": ["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"],
-    }
-    if source_nodata is not None:
-        warp_kwargs["srcNodata"] = source_nodata
-        warp_kwargs["dstNodata"] = source_nodata
-
-    # print(f"Reference raster: {reference_path}")
-    # print(f"Desert mask: {desert_mask_vrt}")
-    # print(f"Output raster: {output_path}")
-
-    output_ds = gdal.Warp(
-        output_path,
-        desert_ds,
-        options=gdal.WarpOptions(**warp_kwargs),
-    )
-    if output_ds is None:
-        raise RuntimeError(f"Failed to create desert mask: {output_path}")
-
-    output_ds.FlushCache()
-    output_ds = None
-    desert_ds = None
-    elapsed = time.perf_counter() - start_time
-    print(f"Desert mask completed in {elapsed:.2f} seconds.")
-except Exception:
-    print(
-        "ERROR: Desert mask calculation failed. Creating an empty nodata mask ",
-        "so processing can continue.",
-        file=sys.stderr,
-    )
-    # traceback.print_exc()
-    create_nodata_desert_raster(reference_ds)
-    print("Empty desert mask created so processing can continue.")
-finally:
-    reference_ds = None
+if __name__ == "__main__":
+    main()

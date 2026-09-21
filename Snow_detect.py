@@ -2,7 +2,7 @@
 
 import argparse
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 import re
 import shutil
@@ -11,13 +11,8 @@ import time
 import urllib.request
 
 import numpy as np
-import planetary_computer
 import rasterio
-from eodag import EODataAccessGateway, setup_logging
-from osgeo import gdal
 from rasterio.warp import transform_bounds
-
-gdal.UseExceptions()
 
 MASK_NODATA = 255
 CLOUD_CLASSES = (3, 8, 9, 10)
@@ -33,6 +28,7 @@ def parse_s1_time(product_name):
 
 
 def download_scl_asset(href, destination):
+    import planetary_computer
     signed_href = planetary_computer.sign_url(href)
     os.makedirs(os.path.dirname(destination), exist_ok=True)
     partial = f"{destination}.part"
@@ -58,7 +54,11 @@ def write_mask(path, data, profile, description):
         dst.set_band_description(1, description)
 
 
-def generate_s2_masks(product_name, reference_path, output_dir):
+def generate_s2_masks(product_name, reference_path, output_dir, acquisition_time=None, strict=False):
+    from eodag import EODataAccessGateway, setup_logging
+    from osgeo import gdal
+
+    gdal.UseExceptions()
     started = time.perf_counter()
     reference_path = os.path.abspath(os.path.expanduser(reference_path))
     output_dir = os.path.abspath(os.path.expanduser(output_dir))
@@ -80,8 +80,14 @@ def generate_s2_masks(product_name, reference_path, output_dir):
         )
         reference_projection = reference.crs.to_wkt()
         reference_bounds = tuple(reference.bounds)
+        sar_valid = np.isfinite(reference.read(1, masked=True).astype(np.float32).filled(np.nan))
 
-    end_dt = parse_s1_time(product_name)
+    if acquisition_time is None:
+        end_dt = parse_s1_time(product_name)
+    else:
+        end_dt = datetime.fromisoformat(acquisition_time.replace("Z", "+00:00"))
+        if end_dt.tzinfo is not None:
+            end_dt = end_dt.astimezone(timezone.utc).replace(tzinfo=None)
     start_dt = end_dt - timedelta(days=15)
     geom = {
         "lonmin": bounds_wgs84[0], "latmin": bounds_wgs84[1],
@@ -103,6 +109,8 @@ def generate_s2_masks(product_name, reference_path, output_dir):
         asset = product.assets.get("SCL_20m")
         href = asset.get("href") if asset is not None else None
         if date_match is None or not isinstance(href, str) or not href:
+            if strict:
+                raise ValueError(f"Sentinel-2 product lacks date or SCL asset: {title}")
             print(f"Skipping Sentinel-2 product without usable SCL/date: {title}")
             continue
         scl_path = os.path.join(workspace, title, "SCL_20m.tif")
@@ -110,6 +118,8 @@ def generate_s2_masks(product_name, reference_path, output_dir):
             try:
                 download_scl_asset(href, scl_path)
             except Exception as exc:
+                if strict:
+                    raise
                 print(f"SCL download failed for {title}: {exc}", file=sys.stderr)
                 continue
         files_by_date[date_match.group(1)].append(scl_path)
@@ -132,6 +142,8 @@ def generate_s2_masks(product_name, reference_path, output_dir):
                 creationOptions=["TILED=YES", "COMPRESS=DEFLATE"],
             )
             if aligned is None:
+                if strict:
+                    raise RuntimeError(f"Failed to align SCL raster: {scl_path}")
                 print(f"Failed to align SCL raster: {scl_path}", file=sys.stderr)
                 continue
             aligned = None
@@ -149,7 +161,7 @@ def generate_s2_masks(product_name, reference_path, output_dir):
         valid_day_count += daily_valid.astype(np.uint16)
         cloud_day_count += daily_cloud.astype(np.uint16)
 
-    observed = valid_day_count > 0
+    observed = (valid_day_count > 0) & sar_valid
     snow_mask = np.full((rows, cols), MASK_NODATA, dtype=np.uint8)
     cloud_mask = np.full((rows, cols), MASK_NODATA, dtype=np.uint8)
     snow_mask[observed] = snow_any[observed].astype(np.uint8)
@@ -176,6 +188,8 @@ def main():
         ),
     )
     parser.add_argument("output_dir", nargs="?")
+    parser.add_argument("--acquisition-time", help="UTC ISO time; defaults to the timestamp in the product name")
+    parser.add_argument("--strict", action="store_true", help="Stop on failed SCL downloads/alignment")
     args = parser.parse_args()
     legacy_cli = args.output_dir is None
     if legacy_cli:
@@ -189,7 +203,7 @@ def main():
         reference_path = args.reference_raster
 
     generate_s2_masks(
-        args.s1_product_name, reference_path, output_dir
+        args.s1_product_name, reference_path, output_dir, args.acquisition_time, args.strict
     )
 
 
