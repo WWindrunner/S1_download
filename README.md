@@ -267,7 +267,9 @@ Edit `execute.sh` before submission:
 - Set `desert_mask_vrt` to the external global desert-mask VRT.
 - Export `CDSE_USERNAME` and `CDSE_PASSWORD` for Sentinel-1 CDSE.
 - Set `SENSOR`, `PRODUCT_TYPE` and `DOWNLOAD_SOURCE`, or use their defaults.
-- Add exact product names to `product_names`, or set the extent and dates.
+- Add one or more exact SAR product names to `product_names`. The ordinary
+  `execute.sh` submission does not perform spatial/time searches; those searches
+  remain in `execute_flood_warning.sh` for the daily flood-warning workflow.
 - Update the Conda, project, SNAP, Slurm partition, and log paths when running
   on a different system.
 
