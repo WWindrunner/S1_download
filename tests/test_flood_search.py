@@ -31,7 +31,8 @@ class FloodSearchTests(unittest.TestCase):
     def setUp(self):
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
-        self.ns = dict(datetime=datetime, os=os, np=np, pd=pd, requests=Mock(),
+        self.ns = dict(datetime=datetime, os=os, json=json, tempfile=tempfile,
+                       np=np, pd=pd, requests=Mock(),
                        box=box, shape=shape, loads=loads, MIN_FLOOD_OVERLAP_KM2=50.0,
                        rasterio=rasterio, rasterize=rasterize, geometry_window=geometry_window,
                        Window=Window, WindowError=WindowError, mapping=mapping, perf_counter=perf_counter)
@@ -87,17 +88,137 @@ class FloodSearchTests(unittest.TestCase):
 
     def test_inclusive_range_and_duplicate_regions(self):
         download = self.ns["download_flood_warning_shp_from_ESA"] = Mock()
-        self.ns["simplify_flood_warning_shp_from_ESA"] = Mock(return_value=pd.DataFrame([{"x": 1}, {"x": 2}]))
+        self.ns["simplify_flood_warning_shp_from_ESA"] = Mock(return_value=pd.DataFrame([
+            dict(minx=0, miny=0, maxx=1, maxy=1),
+            dict(minx=0.5, miny=0, maxx=1.5, maxy=1),
+        ]))
 
-        def search(df, year, month, day, feature):
-            name = f"scene-{day}.SAFE" if day != 1 else "scene-1"
-            return pd.concat([df, pd.DataFrame([{"Id": str(day), "Name": name}])])
+        def search(regions, day):
+            name = f"scene-{day.day}.SAFE" if day.day != 1 else "scene-1"
+            return [{"Id": str(day.day), "Name": name}]
 
-        self.ns["search_sentinel_with_shape_extent_and_data"] = search
+        grouped = self.ns["_search_grouped_sentinel_day"] = Mock(side_effect=search)
         with tempfile.TemporaryDirectory() as directory:
             result = self.ns["search_flood_images_by_date_range"]("2024-02-28", "2024-03-01", directory)
         self.assertEqual(result, {"names": ["scene-28", "scene-29", "scene-1"], "count": 3})
         self.assertEqual(download.call_count, 3)
+        self.assertEqual(grouped.call_count, 3)
+
+    def test_grouped_queries_preserve_per_region_overlap_and_pagination(self):
+        regions = pd.DataFrame([
+            dict(minx=0, miny=0, maxx=1, maxy=1, geometry=box(0, 0, 1, 1)),
+            dict(minx=1.2, miny=0, maxx=2.2, maxy=1, geometry=box(1.2, 0, 2.2, 1)),
+            dict(minx=10, miny=0, maxx=11, maxy=1, geometry=box(10, 0, 11, 1)),
+        ])
+        pages = [Mock(), Mock(), Mock()]
+        pages[0].json.return_value = {
+            "value": [{"Id": "first", "Name": "first.SAFE",
+                       "GeoFootprint": mapping(box(0, 0, 1, 1))}],
+            "@odata.nextLink": "https://example.test/page2",
+        }
+        pages[1].json.return_value = {
+            "value": [{"Id": "second", "Name": "second.SAFE",
+                       "GeoFootprint": mapping(box(1.2, 0, 2.2, 1))},
+                      {"Id": "first", "Name": "first.SAFE",
+                       "GeoFootprint": mapping(box(0, 0, 1, 1))}]}
+        pages[2].json.return_value = {
+            "value": [{"Id": "third", "Name": "third.SAFE",
+                       "GeoFootprint": mapping(box(10, 0, 11, 1))}]}
+        self.ns["requests"].get.side_effect = pages
+        result = self.ns["_search_grouped_sentinel_day"](regions, datetime.date(2025, 4, 1))
+        self.assertEqual([p["Id"] for p in result], ["first", "second", "third"])
+        self.assertEqual(self.ns["requests"].get.call_count, 3)
+        calls = self.ns["requests"].get.call_args_list
+        self.assertIn("ContentDate/Start ge 2025-04-01T00:00:00.000Z", calls[0].args[0])
+        self.assertIn("ContentDate/Start lt 2025-04-02T00:00:00.000Z", calls[0].args[0])
+        self.assertEqual(calls[1].args[0], "https://example.test/page2")
+        queried_polygon = calls[2].args[0].split("SRID=4326;", 1)[1].split("')", 1)[0]
+        self.assertTrue(loads(queried_polygon).equals(box(10, 0, 11, 1)))
+
+    def test_checkpoint_resumes_after_failed_day_and_refreshes_on_request(self):
+        download = self.ns["download_flood_warning_shp_from_ESA"] = Mock()
+        self.ns["simplify_flood_warning_shp_from_ESA"] = Mock(return_value=pd.DataFrame())
+        grouped = self.ns["_search_grouped_sentinel_day"] = Mock(side_effect=[
+            [{"Id": "a", "Name": "scene-a.SAFE"}],
+            RuntimeError("catalogue unavailable"),
+            [{"Id": "b", "Name": "scene-b.SAFE"}],
+            [{"Id": "a", "Name": "scene-a.SAFE"}],
+            [{"Id": "b", "Name": "scene-b.SAFE"}],
+        ])
+        search = self.ns["search_flood_images_by_date_range"]
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "2025-04-02"):
+                search("2025-04-01", "2025-04-02", directory)
+            checkpoint = Path(directory) / "2025-04-01" / "search_s1_checkpoint.json"
+            self.assertTrue(checkpoint.is_file())
+            self.assertFalse((Path(directory) / "2025-04-02" / "search_s1_checkpoint.json").exists())
+            self.assertEqual(search("2025-04-01", "2025-04-02", directory),
+                             {"names": ["scene-a", "scene-b"], "count": 2})
+            self.assertEqual(download.call_count, 3)
+            self.assertEqual(grouped.call_count, 3)
+            self.assertEqual(search("2025-04-01", "2025-04-02", directory, refresh=True),
+                             {"names": ["scene-a", "scene-b"], "count": 2})
+            self.assertEqual(download.call_count, 5)
+            self.assertEqual(grouped.call_count, 5)
+
+    def test_checkpoint_reuses_empty_results_and_rejects_stale_or_broken_data(self):
+        download = self.ns["download_flood_warning_shp_from_ESA"] = Mock()
+        self.ns["simplify_flood_warning_shp_from_ESA"] = Mock(return_value=pd.DataFrame())
+        search = self.ns["search_flood_images_by_date_range"]
+        with tempfile.TemporaryDirectory() as directory:
+            for _ in range(2):
+                self.assertEqual(search("2025-04-01", "2025-04-01", directory),
+                                 {"names": [], "count": 0})
+            self.assertEqual(download.call_count, 1)
+            search("2025-04-01", "2025-04-01", directory, window_size=12)
+            self.assertEqual(download.call_count, 2)
+            search("2025-04-01", "2025-04-01", directory, window_size=12, area_thresholds=500)
+            self.assertEqual(download.call_count, 3)
+            self.ns["MIN_FLOOD_OVERLAP_KM2"] = 60.0
+            search("2025-04-01", "2025-04-01", directory, window_size=12, area_thresholds=500)
+            self.assertEqual(download.call_count, 4)
+            checkpoint = Path(directory) / "2025-04-01" / "search_s1_checkpoint.json"
+            checkpoint.write_text('{"products":', encoding="utf-8")
+            search("2025-04-01", "2025-04-01", directory, window_size=12, area_thresholds=500)
+            self.assertEqual(download.call_count, 5)
+            self.assertEqual(list(Path(directory).rglob("*.tmp")), [])
+
+    def test_grouped_raster_results_equal_legacy_without_combining_region_counts(self):
+        transform = from_origin(0, 12/111, 1/111, 1/111)
+        labels = np.zeros((12, 30), dtype="uint32")
+        labels[:, :10] = 1
+        labels[:, 20:] = 2
+        footprints = {
+            "left": box(0, 0, 10/111, 12/111),
+            "right": box(20/111, 0, 30/111, 12/111),
+            "gap": box(10/111, 0, 20/111, 12/111),
+            # 40 pixels in each region: a grouped sum would wrongly accept this.
+            "split": box(0, 8/111, 30/111, 12/111),
+        }
+        products = [{"Id": name, "Name": name + ".SAFE", "GeoFootprint": mapping(geom)}
+                    for name, geom in footprints.items()]
+        response = Mock()
+        response.json.return_value = {"value": products}
+        self.ns["requests"].get.return_value = response
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "labels.tif")
+            self.write_raster(path, labels, transform)
+            regions = pd.DataFrame([
+                dict(minx=0, miny=0, maxx=10/111, maxy=12/111,
+                     warning_raster=path, warning_region=1),
+                dict(minx=20/111, miny=0, maxx=30/111, maxy=12/111,
+                     warning_raster=path, warning_region=2),
+            ])
+            legacy = pd.DataFrame(columns=["Id", "Name"])
+            for _, feature in regions.iterrows():
+                legacy = self.ns["search_sentinel_with_shape_extent_and_data"](
+                    legacy, 2025, 4, 1, feature)
+            self.assertEqual(self.ns["requests"].get.call_count, 2)
+            self.ns["requests"].get.reset_mock()
+            grouped = self.ns["_search_grouped_sentinel_day"](regions, datetime.date(2025, 4, 1))
+            self.assertEqual(self.ns["requests"].get.call_count, 1)
+            self.assertEqual({p["Id"] for p in grouped}, set(legacy.Id))
+            self.assertEqual({p["Id"] for p in grouped}, {"left", "right"})
 
     def write_raster(self, path, data, transform):
         with rasterio.open(path, "w", driver="GTiff", height=data.shape[0],
@@ -189,7 +310,7 @@ class FloodSearchTests(unittest.TestCase):
                     search(start, end, directory)
             self.ns["download_flood_warning_shp_from_ESA"].side_effect = OSError("unavailable")
             with self.assertRaisesRegex(RuntimeError, "2024-01-01"):
-                search("2024-01-01", "2024-01-02", directory)
+                search("2024-01-01", "2024-01-02", directory, refresh=True)
 
     def test_nisar_search_uses_original_pixels_and_same_overlap_threshold(self):
         import NISAR_extent_time_download as nisar
@@ -300,7 +421,8 @@ class FloodSearchTests(unittest.TestCase):
             with patch.object(sys, "argv", argv):
                 self.ns["main"]()
             search.assert_called_once_with("2026-07-07", "2026-07-08", directory,
-                                           window_size=10, area_thresholds=1000, sensor="nisar")
+                                           window_size=10, area_thresholds=1000,
+                                           sensor="nisar", refresh=False)
             self.ns["run_new_processing_chain"].assert_not_called()
             search.reset_mock()
             with (patch.object(sys, "argv", argv + ["--download-source", "cdse"]),

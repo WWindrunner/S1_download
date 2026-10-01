@@ -358,6 +358,66 @@ separate from this download/preprocessing change.
 
 ## Search flood-warning SAR images over a date range
 
+For a Slurm job on the configured stormcenter server, submit `search_S1.sh`:
+
+```bash
+sbatch search_S1.sh
+sbatch --export=ALL,START_DATE=2025-10-01,END_DATE=2025-10-07 search_S1.sh
+```
+
+The script searches Sentinel-1 only. Its defaults are `START_DATE=2025-06-01`,
+`END_DATE=2025-07-01` (both inclusive), and
+`WORK_DIRECTORY=/shared/stormcenter/Shen/retrieval/RAPID/S1_download/temp`.
+Set `OUTPUT_JSON` to choose the result file; otherwise it writes
+`result_YYYYMMDD_YYYYMMDD.json` in `WORK_DIRECTORY`, using the selected date range.
+`search_S1.sh` enables `--clean-search --names-only`: its result is a JSON list
+of unique, sorted product names beginning with `S1`, without the `.SAFE` suffix
+or a `names`/`count` wrapper. For example: `["S1A_IW_GRDH_1SDV_..."]`.
+After each day, its dedicated `WORK_DIRECTORY/YYYY-MM-DD/ESA_flood_waring/`
+directory (downloaded warnings and intermediate rasters/shapefiles) is deleted.
+This also cleans leftover intermediates when a completed day is resumed.
+Failed days have their intermediates removed and are recomputed on retry.
+Daily checkpoint JSON files are retained for resume; no SAR imagery is downloaded.
+Keep result files outside the daily `ESA_flood_waring` directories.
+The Slurm log, Conda paths, and default work directory in the script are specific
+to that server; update them before submitting elsewhere. Submit from the project
+directory, or set `PROJECT_DIRECTORY` to the project path. Under Slurm the script
+uses `SLURM_SUBMIT_DIR`; a direct Bash invocation uses the script's directory.
+It only searches and writes the result JSON; it does not download or process SAR
+scenes. Additional Python options can be passed after `search_S1.sh`.
+
+Sentinel-1 date-range searches now save a checkpoint after each successful day:
+`WORK_DIRECTORY/YYYY-MM-DD/search_s1_checkpoint.json`. Repeating the command
+with the same work directory resumes automatically, including completed days
+with zero matches. The selected start/end dates can change; completed dates in
+the new range are reused. Checkpoints match the date, sensor, window size,
+region-area threshold, overlap threshold and format version. Incomplete or
+invalid checkpoints are recomputed. A failed day stops the job; completed
+earlier days remain saved. The final JSON is written only after the entire
+requested range succeeds. Direct Python commands keep the existing `names`/`count`
+format and intermediate files unless `--names-only` and `--clean-search` are added.
+
+To refresh completed days, including catalogue products published since the
+previous search, use:
+
+```bash
+sbatch search_S1.sh --refresh-search
+# The same flag is available on the Python --search-only command below.
+```
+
+For Sentinel-1 date-range searches, nearby warning-region bounding boxes share
+a catalogue query: gaps in either axis must be at most 0.5 degrees, and the
+merged box must span at most 5 degrees in each axis. A larger individual region
+is queried alone. All result pages are read and products are deduplicated.
+Candidates still pass the original **per-region** warning-pixel overlap test;
+pixels from different regions are never added together to reach 50 km2. Logs
+report region/group counts, catalogue pages, unique candidates, overlap checks,
+and separate catalogue/overlap times. Grouping reduces catalogue requests when
+regions are close; it does not change the existing warning-raster preparation.
+Daily processing, exact-name downloads, and the NISAR search path retain their
+existing search behavior. The new checkpoints apply only to Sentinel-1
+date-range searches.
+
 Run in the project's Conda environment:
 
 ```bash

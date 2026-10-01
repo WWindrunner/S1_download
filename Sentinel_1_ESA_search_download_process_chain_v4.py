@@ -341,8 +341,146 @@ def search_nisar_with_shape_extent_and_data(df, year, month, day, feature):
     return df
 
 
+def _group_sentinel_warning_regions(regions):
+    """Group bounds at most 0.5 degrees apart, with merged spans <=5 degrees.
+
+    A larger individual region keeps its full bounds and is queried alone.
+    These limits affect catalogue prefilters only, never the overlap threshold.
+    """
+    groups = []
+    for _, feature in regions.iterrows():
+        bounds = (feature["minx"], feature["miny"], feature["maxx"], feature["maxy"])
+        for group in groups:
+            left, bottom, right, top = group["bounds"]
+            combined = (min(left, bounds[0]), min(bottom, bounds[1]),
+                        max(right, bounds[2]), max(top, bounds[3]))
+            if (bounds[0] <= right + 0.5 and bounds[2] >= left - 0.5
+                    and bounds[1] <= top + 0.5 and bounds[3] >= bottom - 0.5
+                    and combined[2] - combined[0] <= 5
+                    and combined[3] - combined[1] <= 5):
+                group["bounds"] = combined
+                group["features"].append(feature)
+                break
+        else:
+            groups.append({"bounds": bounds, "features": [feature]})
+    return groups
+
+
+def _search_grouped_sentinel_day(regions, day):
+    """Fetch once per nearby group, then apply the original per-region test."""
+    products = {}
+    groups = _group_sentinel_warning_regions(regions)
+    page_count = 0
+    candidate_ids = set()
+    overlap_checks = 0
+    catalogue_seconds = 0.0
+    overlap_seconds = 0.0
+    start = f"{day.isoformat()}T00:00:00.000Z"
+    end = f"{(day + datetime.timedelta(days=1)).isoformat()}T00:00:00.000Z"
+    print(f"Querying {len(groups)} groups for {len(regions)} warning regions...", flush=True)
+    for group in groups:
+        left, bottom, right, top = group["bounds"]
+        polygon = (f"{left} {top}, {left} {bottom}, {right} {bottom}, "
+                   f"{right} {top}, {left} {top}")
+        query_url = (
+            "https://catalogue.dataspace.copernicus.eu/odata/v1/Products?"
+            f"$filter=OData.CSC.Intersects(area=geography'SRID=4326;POLYGON(({polygon}))') "
+            "and Collection/Name eq 'SENTINEL-1' "
+            "and Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'productType' "
+            "and att/OData.CSC.StringAttribute/Value eq 'IW_GRDH_1S') "
+            f"and ContentDate/Start ge {start} "
+            f"and ContentDate/Start lt {end}"
+        )
+        candidates = {}
+        started = perf_counter()
+        while query_url:
+            response = requests.get(query_url, timeout=120)
+            response.raise_for_status()
+            payload = response.json()
+            page_count += 1
+            for product in payload["value"]:
+                candidates.setdefault(product["Id"], product)
+            query_url = payload.get("@odata.nextLink") or payload.get("@OData.nextLink")
+        catalogue_seconds += perf_counter() - started
+        candidate_ids.update(candidates)
+        started = perf_counter()
+        for feature in group["features"]:
+            use_raster = bool(feature.get("warning_raster"))
+            warning_geometry = None if use_raster else _warning_geometry(feature)
+            if not use_raster and warning_geometry.is_empty:
+                continue
+            for product in candidates.values():
+                if product["Id"] in products:
+                    continue
+                overlap_checks += 1
+                if (_has_raster_flood_overlap(product, feature) if use_raster
+                        else _has_flood_overlap(product, warning_geometry)):
+                    products[product["Id"]] = product
+        overlap_seconds += perf_counter() - started
+    print(f"Catalogue: {page_count} pages, {len(candidate_ids)} unique candidates, "
+          f"{catalogue_seconds:.1f}s; overlap: {overlap_checks} checks, "
+          f"{overlap_seconds:.1f}s.", flush=True)
+    return list(products.values())
+
+
+def _read_flood_search_checkpoint(path, day, sensor, window_size, area_thresholds):
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as stream:
+            saved = json.load(stream)
+        if (saved.get("version") != 1 or saved.get("date") != day.isoformat()
+                or saved.get("sensor") != sensor or saved.get("window_size") != window_size
+                or saved.get("area_thresholds") != area_thresholds
+                or saved.get("min_flood_overlap_km2") != MIN_FLOOD_OVERLAP_KM2):
+            return None
+        products = saved["products"]
+        if not isinstance(products, list) or any(
+                not isinstance(p, dict) or not isinstance(p.get("Id"), str)
+                or not isinstance(p.get("Name"), str) for p in products):
+            return None
+        return products
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def _write_flood_search_checkpoint(path, day, sensor, window_size, area_thresholds, products):
+    saved = {"version": 1, "date": day.isoformat(), "sensor": sensor,
+             "window_size": window_size, "area_thresholds": area_thresholds,
+             "min_flood_overlap_km2": MIN_FLOOD_OVERLAP_KM2,
+             "products": [{"Id": p["Id"], "Name": p["Name"]} for p in products]}
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=os.path.dirname(path),
+                                         prefix=".search_checkpoint_", suffix=".tmp",
+                                         delete=False) as stream:
+            temporary = stream.name
+            json.dump(saved, stream, indent=2)
+            stream.write("\n")
+        os.replace(temporary, path)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.remove(temporary)
+
+
+def _clean_flood_search_intermediates(work_directory, day):
+    """Remove only the dedicated warning directory for this searched date."""
+    root = os.path.realpath(work_directory)
+    directory = os.path.join(root, day.isoformat(), "ESA_flood_waring")
+    if not os.path.lexists(directory):
+        return
+    # Refuse redirected paths (including a linked date directory).
+    resolved = os.path.realpath(directory)
+    if (os.path.normcase(resolved) != os.path.normcase(directory)
+            or os.path.commonpath([root, resolved]) != root):
+        raise ValueError(f"Refusing to remove redirected warning directory: {directory}")
+    shutil.rmtree(directory)
+    print(f"Removed search intermediates for {day.isoformat()}.", flush=True)
+
+
 def search_flood_images_by_date_range(start_date, end_date, work_directory,
-                                     window_size=10, area_thresholds=1000, sensor="s1"):
+                                     window_size=10, area_thresholds=1000, sensor="s1",
+                                     refresh=False, clean=False):
     """Return product names without .SAFE and count for daily warning-area SAR scenes.
 
     Dates are YYYY-MM-DD strings, inclusive in UTC. Each day's GloFAS mask
@@ -351,9 +489,16 @@ def search_flood_images_by_date_range(start_date, end_date, work_directory,
     and intermediate masks are saved under work_directory; SAR is not downloaded.
     Any missing warning archive or failed catalogue request raises an exception
     rather than returning an incomplete count as a successful result.
+    Sentinel-1 uses grouped catalogue queries and daily checkpoints. Set refresh=True
+    to search completed dates again (e.g. for newly published catalogue products).
+    Set clean=True to remove daily warning intermediates, including failed days;
+    completed-day checkpoints remain available for resume.
+    NISAR retains its existing per-region search without checkpoints.
     """
     if sensor not in ("s1", "nisar"):
         raise ValueError(f"Unknown sensor: {sensor}")
+    if clean and sensor != "s1":
+        raise ValueError("Search cleanup is supported only for Sentinel-1 date-range searches")
     search = (search_sentinel_with_shape_extent_and_data if sensor == "s1"
               else search_nisar_with_shape_extent_and_data)
     start = datetime.date.fromisoformat(start_date)
@@ -371,6 +516,19 @@ def search_flood_images_by_date_range(start_date, end_date, work_directory,
         day_started = perf_counter()
         directory = os.path.join(work_directory, current.isoformat(), "ESA_flood_waring")
         os.makedirs(directory, exist_ok=True)
+        checkpoint = os.path.join(work_directory, current.isoformat(),
+                                  f"search_{sensor}_checkpoint.json")
+        cached = None if sensor != "s1" or refresh else _read_flood_search_checkpoint(
+            checkpoint, current, sensor, window_size, area_thresholds)
+        if cached is not None:
+            print(f"Reusing search checkpoint for {current.isoformat()} ({len(cached)} images).",
+                  flush=True)
+            for product in cached:
+                products.setdefault(product["Id"], product)
+            if clean:
+                _clean_flood_search_intermediates(work_directory, current)
+            current += datetime.timedelta(days=1)
+            continue
         print(f"Searching flood-warning images for {current.isoformat()}", flush=True)
         try:
             download_flood_warning_shp_from_ESA(
@@ -378,22 +536,30 @@ def search_flood_images_by_date_range(start_date, end_date, work_directory,
             )
             shapefile = os.path.join(directory, f"FloodMaskMerged{current:%Y%m%d}00.shp")
             regions = simplify_flood_warning_shp_from_ESA(shapefile, window_size, area_thresholds)
-            daily = pd.DataFrame(columns=["Id", "Name"])
             search_started = perf_counter()
             print(f"Searching SAR catalogue and checking overlap ({len(regions)} regions)...",
                   end="", flush=True)
-            for _, feature in regions.iterrows():
-                daily = search(
-                    daily, current.year, current.month, current.day, feature
-                )
+            if sensor == "s1":
+                daily_products = _search_grouped_sentinel_day(regions, current)
+            else:
+                daily = pd.DataFrame(columns=["Id", "Name"])
+                for _, feature in regions.iterrows():
+                    daily = search(daily, current.year, current.month, current.day, feature)
+                daily_products = daily[["Id", "Name"]].to_dict("records")
             print(f" finished in {perf_counter() - search_started:.1f}s.", flush=True)
-            for product in daily[["Id", "Name"]].to_dict("records"):
+            if sensor == "s1":
+                _write_flood_search_checkpoint(checkpoint, current, sensor, window_size,
+                                               area_thresholds, daily_products)
+            for product in daily_products:
                 products.setdefault(product["Id"], product)
-            print(f"{current.isoformat()}: {daily['Id'].nunique()} unique images; "
+            print(f"{current.isoformat()}: {len({p['Id'] for p in daily_products})} unique images; "
                   f"day total {perf_counter() - day_started:.1f}s; "
                   f"cumulative {len(products)} images.", flush=True)
         except Exception as exc:
             raise RuntimeError(f"Flood image search failed for {current.isoformat()}: {exc}") from exc
+        finally:
+            if clean:
+                _clean_flood_search_intermediates(work_directory, current)
         current += datetime.timedelta(days=1)
 
     names = [product["Name"].removesuffix(".SAFE") for product in products.values()]
@@ -648,6 +814,12 @@ def main():
     parser.add_argument("--end-date", help="Last UTC date, YYYY-MM-DD (inclusive).")
     parser.add_argument("--work-directory", default=os.path.join(SCRIPT_DIR, "data"))
     parser.add_argument("--output-json", help="Save product names without .SAFE and count to this JSON file.")
+    parser.add_argument("--refresh-search", action="store_true",
+                        help="Ignore saved Sentinel-1 date-range search checkpoints.")
+    parser.add_argument("--clean-search", action="store_true",
+                        help="Remove each searched day's warning intermediates; retain checkpoints (S1 only).")
+    parser.add_argument("--names-only", action="store_true",
+                        help="Write a JSON list of unique S1 product names instead of names/count (S1 only).")
     parser.add_argument("--window-size", type=int, default=10)
     parser.add_argument("--area-thresholds", type=float, default=1000)
     parser.add_argument("--sensor", choices=("s1", "nisar"), default="s1")
@@ -660,18 +832,33 @@ def main():
     if args.search_only:
         if not args.start_date or not args.end_date:
             parser.error("--search-only requires --start-date and --end-date")
+        if args.sensor != "s1" and (args.clean_search or args.names_only):
+            parser.error("--clean-search and --names-only require --sensor s1")
+        if args.clean_search and args.output_json:
+            try:
+                relative = os.path.relpath(os.path.realpath(args.output_json),
+                                           os.path.realpath(args.work_directory))
+            except ValueError:  # Different Windows drives cannot overlap.
+                relative = ""
+            parts = relative.split(os.sep)
+            if len(parts) >= 3 and parts[1] == "ESA_flood_waring":
+                parser.error("Place --output-json outside the daily ESA_flood_waring directories")
         result = search_flood_images_by_date_range(
             args.start_date, args.end_date, args.work_directory,
             window_size=args.window_size, area_thresholds=args.area_thresholds,
-            sensor=args.sensor,
+            sensor=args.sensor, refresh=args.refresh_search,
+            **({"clean": True} if args.clean_search else {}),
         )
+        if args.names_only:
+            result = sorted({name for name in result["names"] if name.startswith("S1")})
         output = json.dumps(result, indent=2)
         if args.output_json:
             with open(args.output_json, "w", encoding="utf-8") as stream:
                 stream.write(output + "\n")
         print(output)
         return
-    if args.start_date or args.end_date or args.output_json:
+    if (args.start_date or args.end_date or args.output_json or args.refresh_search
+            or args.clean_search or args.names_only):
         parser.error("Date-range and JSON output options require --search-only")
     if not args.desert_mask_vrt:
         parser.error("--desert-mask-vrt is required for processing")
