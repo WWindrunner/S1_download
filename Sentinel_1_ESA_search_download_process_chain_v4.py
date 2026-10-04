@@ -42,6 +42,30 @@ import pdb
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MIN_FLOOD_OVERLAP_KM2 = 50.0
 
+
+def _get_search_data(url, timeout=120, attempts=4):
+    """Retry transient network and server failures during warning/search requests."""
+    from time import sleep
+    from requests.exceptions import ConnectionError, HTTPError, Timeout
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, timeout=timeout)
+            response.raise_for_status()
+            return response
+        except (ConnectionError, Timeout, HTTPError) as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            retryable = not isinstance(exc, HTTPError) or status == 429 or (
+                status is not None and 500 <= status < 600
+            )
+            if not retryable or attempt == attempts:
+                raise
+            delay = 2 ** attempt
+            print(f"Request failed ({exc}); retrying in {delay}s "
+                  f"({attempt}/{attempts - 1})...", flush=True)
+            sleep(delay)
+
+
 def log_in(username,password):
     auth_url = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
     auth_data = {
@@ -63,8 +87,7 @@ def download_flood_warning_shp_from_ESA(year,month,day, directory):
     print("Downloading and extracting GloFAS warnings...", end="", flush=True)
     glofas_date = datetime.datetime(year, month, day).strftime("%Y%m%dT00:00Z")
     url = f"https://european-flood.emergency.copernicus.eu/api/fms/download/glofas/RapidFloodMapping/{glofas_date}"
-    response = requests.get(url, timeout=120)
-    response.raise_for_status()
+    response = _get_search_data(url)
     with zipfile.ZipFile(io.BytesIO(response.content)) as z:
         z.extractall(path=directory)
     print(f" finished in {perf_counter() - started:.1f}s.", flush=True)
@@ -300,8 +323,7 @@ def search_sentinel_with_shape_extent_and_data(df,year,month,day,feature):
         f"and ContentDate/Start lt {end_date}"
     )
     while query_url:
-        response = requests.get(query_url, timeout=120)
-        response.raise_for_status()
+        response = _get_search_data(query_url)
         response_json = response.json()
         df2 = pd.DataFrame.from_dict([
             product for product in response_json['value']
@@ -394,8 +416,7 @@ def _search_grouped_sentinel_day(regions, day):
         candidates = {}
         started = perf_counter()
         while query_url:
-            response = requests.get(query_url, timeout=120)
-            response.raise_for_status()
+            response = _get_search_data(query_url)
             payload = response.json()
             page_count += 1
             for product in payload["value"]:
@@ -487,8 +508,8 @@ def search_flood_images_by_date_range(start_date, end_date, work_directory,
     selects that same day's Sentinel-1 IW_GRDH_1S acquisitions by default, or
     NISAR GCOV when sensor="nisar". Existing positional arguments are unchanged. Warning files
     and intermediate masks are saved under work_directory; SAR is not downloaded.
-    Any missing warning archive or failed catalogue request raises an exception
-    rather than returning an incomplete count as a successful result.
+    Failed days are recorded and later days are still searched. The result
+    includes failed_dates so an incomplete count cannot be mistaken for complete.
     Sentinel-1 uses grouped catalogue queries and daily checkpoints. Set refresh=True
     to search completed dates again (e.g. for newly published catalogue products).
     Set clean=True to remove daily warning intermediates, including failed days;
@@ -511,6 +532,7 @@ def search_flood_images_by_date_range(start_date, end_date, work_directory,
         raise ValueError("area_thresholds must be finite and nonnegative")
 
     products = {}
+    failed_dates = []
     current = start
     while current <= end:
         day_started = perf_counter()
@@ -526,7 +548,12 @@ def search_flood_images_by_date_range(start_date, end_date, work_directory,
             for product in cached:
                 products.setdefault(product["Id"], product)
             if clean:
-                _clean_flood_search_intermediates(work_directory, current)
+                try:
+                    _clean_flood_search_intermediates(work_directory, current)
+                except Exception as exc:
+                    failed_dates.append(current.isoformat())
+                    print(f"Search cleanup failed for {current.isoformat()}: {exc}",
+                          file=sys.stderr, flush=True)
             current += datetime.timedelta(days=1)
             continue
         print(f"Searching flood-warning images for {current.isoformat()}", flush=True)
@@ -556,14 +583,22 @@ def search_flood_images_by_date_range(start_date, end_date, work_directory,
                   f"day total {perf_counter() - day_started:.1f}s; "
                   f"cumulative {len(products)} images.", flush=True)
         except Exception as exc:
-            raise RuntimeError(f"Flood image search failed for {current.isoformat()}: {exc}") from exc
+            failed_dates.append(current.isoformat())
+            print(f"Flood image search failed for {current.isoformat()}: {exc}",
+                  file=sys.stderr, flush=True)
         finally:
             if clean:
-                _clean_flood_search_intermediates(work_directory, current)
+                try:
+                    _clean_flood_search_intermediates(work_directory, current)
+                except Exception as exc:
+                    if current.isoformat() not in failed_dates:
+                        failed_dates.append(current.isoformat())
+                    print(f"Search cleanup failed for {current.isoformat()}: {exc}",
+                          file=sys.stderr, flush=True)
         current += datetime.timedelta(days=1)
 
     names = [product["Name"].removesuffix(".SAFE") for product in products.values()]
-    return {"names": names, "count": len(names)}
+    return {"names": names, "count": len(names), "failed_dates": failed_dates}
 
 
 def download_Sentinel_with_ids_names(ids,name,output_dir,access_token):
@@ -849,14 +884,18 @@ def main():
             sensor=args.sensor, refresh=args.refresh_search,
             **({"clean": True} if args.clean_search else {}),
         )
+        failed_dates = result["failed_dates"]
         if args.names_only:
             result = sorted({name for name in result["names"] if name.startswith("S1")})
+        count = len(result) if args.names_only else result["count"]
         output = json.dumps(result, indent=2)
         if args.output_json:
             with open(args.output_json, "w", encoding="utf-8") as stream:
                 stream.write(output + "\n")
-        print(output)
-        return
+        print(f"Search complete: {count} unique images. "
+              f"Failed dates: {', '.join(failed_dates) if failed_dates else 'none'}.",
+              flush=True)
+        return 1 if failed_dates else 0
     if (args.start_date or args.end_date or args.output_json or args.refresh_search
             or args.clean_search or args.names_only):
         parser.error("Date-range and JSON output options require --search-only")

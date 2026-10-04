@@ -392,10 +392,17 @@ with the same work directory resumes automatically, including completed days
 with zero matches. The selected start/end dates can change; completed dates in
 the new range are reused. Checkpoints match the date, sensor, window size,
 region-area threshold, overlap threshold and format version. Incomplete or
-invalid checkpoints are recomputed. A failed day stops the job; completed
-earlier days remain saved. The final JSON is written only after the entire
-requested range succeeds. Direct Python commands keep the existing `names`/`count`
-format and intermediate files unless `--names-only` and `--clean-search` are added.
+invalid checkpoints are recomputed. A failed day is logged and later dates are
+still searched; completed days remain saved. The final JSON contains names from
+successful dates even if some dates failed, and the job exits nonzero in that
+case. The Slurm log ends with only the unique image count and failed dates; it
+does not print the name list. Direct Python commands return `names`, `count`,
+and `failed_dates`, and keep intermediate files unless `--names-only` and
+`--clean-search` are added.
+GloFAS and Sentinel-1 catalogue requests retry temporary connection failures,
+timeouts, HTTP 429, and HTTP 5xx responses up to four attempts with short waits.
+If all attempts fail, rerun the same command and work directory to resume from
+the last completed day; do not add `--refresh-search` when resuming.
 
 To refresh completed days, including catalogue products published since the
 previous search, use:

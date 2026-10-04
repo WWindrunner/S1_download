@@ -31,12 +31,44 @@ class FloodSearchTests(unittest.TestCase):
     def setUp(self):
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
-        self.ns = dict(datetime=datetime, os=os, json=json, tempfile=tempfile,
+        self.ns = dict(datetime=datetime, os=os, json=json, tempfile=tempfile, sys=sys,
                        np=np, pd=pd, requests=Mock(),
                        box=box, shape=shape, loads=loads, MIN_FLOOD_OVERLAP_KM2=50.0,
                        rasterio=rasterio, rasterize=rasterize, geometry_window=geometry_window,
                        Window=Window, WindowError=WindowError, mapping=mapping, perf_counter=perf_counter)
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(SOURCE), "exec"), self.ns)
+
+    def test_search_request_retries_disconnect_and_server_error(self):
+        from requests.exceptions import ConnectionError, HTTPError
+
+        response = Mock()
+        server_error = HTTPError("server unavailable")
+        server_error.response = Mock(status_code=503)
+        self.ns["requests"].get.side_effect = [ConnectionError("disconnected"),
+                                                  server_error, response]
+        with patch("time.sleep") as sleep:
+            self.assertIs(self.ns["_get_search_data"]("https://example.test"), response)
+        self.assertEqual(self.ns["requests"].get.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4])
+        response.raise_for_status.assert_called_once()
+
+    def test_search_request_does_not_retry_client_error_and_stops_after_limit(self):
+        from requests.exceptions import ConnectionError, HTTPError
+
+        client_error = HTTPError("not found")
+        client_error.response = Mock(status_code=404)
+        self.ns["requests"].get.side_effect = client_error
+        with patch("time.sleep") as sleep, self.assertRaises(HTTPError):
+            self.ns["_get_search_data"]("https://example.test")
+        self.ns["requests"].get.assert_called_once()
+        sleep.assert_not_called()
+
+        self.ns["requests"].get.reset_mock(side_effect=True)
+        self.ns["requests"].get.side_effect = ConnectionError("disconnected")
+        with patch("time.sleep") as sleep, self.assertRaises(ConnectionError):
+            self.ns["_get_search_data"]("https://example.test")
+        self.assertEqual(self.ns["requests"].get.call_count, 4)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4, 8])
 
     def test_pagination_and_midnight_boundaries(self):
         responses = [Mock(), Mock()]
@@ -100,7 +132,8 @@ class FloodSearchTests(unittest.TestCase):
         grouped = self.ns["_search_grouped_sentinel_day"] = Mock(side_effect=search)
         with tempfile.TemporaryDirectory() as directory:
             result = self.ns["search_flood_images_by_date_range"]("2024-02-28", "2024-03-01", directory)
-        self.assertEqual(result, {"names": ["scene-28", "scene-29", "scene-1"], "count": 3})
+        self.assertEqual(result, {"names": ["scene-28", "scene-29", "scene-1"],
+                                  "count": 3, "failed_dates": []})
         self.assertEqual(download.call_count, 3)
         self.assertEqual(grouped.call_count, 3)
 
@@ -141,25 +174,31 @@ class FloodSearchTests(unittest.TestCase):
         grouped = self.ns["_search_grouped_sentinel_day"] = Mock(side_effect=[
             [{"Id": "a", "Name": "scene-a.SAFE"}],
             RuntimeError("catalogue unavailable"),
+            [{"Id": "c", "Name": "scene-c.SAFE"}],
             [{"Id": "b", "Name": "scene-b.SAFE"}],
             [{"Id": "a", "Name": "scene-a.SAFE"}],
             [{"Id": "b", "Name": "scene-b.SAFE"}],
+            [{"Id": "c", "Name": "scene-c.SAFE"}],
         ])
         search = self.ns["search_flood_images_by_date_range"]
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(RuntimeError, "2025-04-02"):
-                search("2025-04-01", "2025-04-02", directory)
+            self.assertEqual(search("2025-04-01", "2025-04-03", directory),
+                             {"names": ["scene-a", "scene-c"], "count": 2,
+                              "failed_dates": ["2025-04-02"]})
             checkpoint = Path(directory) / "2025-04-01" / "search_s1_checkpoint.json"
             self.assertTrue(checkpoint.is_file())
             self.assertFalse((Path(directory) / "2025-04-02" / "search_s1_checkpoint.json").exists())
-            self.assertEqual(search("2025-04-01", "2025-04-02", directory),
-                             {"names": ["scene-a", "scene-b"], "count": 2})
-            self.assertEqual(download.call_count, 3)
-            self.assertEqual(grouped.call_count, 3)
-            self.assertEqual(search("2025-04-01", "2025-04-02", directory, refresh=True),
-                             {"names": ["scene-a", "scene-b"], "count": 2})
-            self.assertEqual(download.call_count, 5)
-            self.assertEqual(grouped.call_count, 5)
+            self.assertTrue((Path(directory) / "2025-04-03" / "search_s1_checkpoint.json").exists())
+            self.assertEqual(search("2025-04-01", "2025-04-03", directory),
+                             {"names": ["scene-a", "scene-b", "scene-c"], "count": 3,
+                              "failed_dates": []})
+            self.assertEqual(download.call_count, 4)
+            self.assertEqual(grouped.call_count, 4)
+            self.assertEqual(search("2025-04-01", "2025-04-03", directory, refresh=True),
+                             {"names": ["scene-a", "scene-b", "scene-c"], "count": 3,
+                              "failed_dates": []})
+            self.assertEqual(download.call_count, 7)
+            self.assertEqual(grouped.call_count, 7)
 
     def test_checkpoint_reuses_empty_results_and_rejects_stale_or_broken_data(self):
         download = self.ns["download_flood_warning_shp_from_ESA"] = Mock()
@@ -168,7 +207,7 @@ class FloodSearchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             for _ in range(2):
                 self.assertEqual(search("2025-04-01", "2025-04-01", directory),
-                                 {"names": [], "count": 0})
+                                 {"names": [], "count": 0, "failed_dates": []})
             self.assertEqual(download.call_count, 1)
             search("2025-04-01", "2025-04-01", directory, window_size=12)
             self.assertEqual(download.call_count, 2)
@@ -304,13 +343,15 @@ class FloodSearchTests(unittest.TestCase):
         self.ns["simplify_flood_warning_shp_from_ESA"] = Mock(return_value=pd.DataFrame())
         search = self.ns["search_flood_images_by_date_range"]
         with tempfile.TemporaryDirectory() as directory:
-            self.assertEqual(search("2024-01-01", "2024-01-01", directory), {"names": [], "count": 0})
+            self.assertEqual(search("2024-01-01", "2024-01-01", directory),
+                             {"names": [], "count": 0, "failed_dates": []})
             for start, end in [("2024-02-30", "2024-03-01"), ("2024-03-02", "2024-03-01")]:
                 with self.assertRaises(ValueError):
                     search(start, end, directory)
             self.ns["download_flood_warning_shp_from_ESA"].side_effect = OSError("unavailable")
-            with self.assertRaisesRegex(RuntimeError, "2024-01-01"):
-                search("2024-01-01", "2024-01-02", directory, refresh=True)
+            self.assertEqual(search("2024-01-01", "2024-01-02", directory, refresh=True),
+                             {"names": [], "count": 0,
+                              "failed_dates": ["2024-01-01", "2024-01-02"]})
 
     def test_nisar_search_uses_original_pixels_and_same_overlap_threshold(self):
         import NISAR_extent_time_download as nisar
@@ -354,7 +395,8 @@ class FloodSearchTests(unittest.TestCase):
                 nisar, "search_nisar", return_value=[candidate]) as query:
             result = self.ns["search_flood_images_by_date_range"](
                 "2026-07-07", "2026-07-08", directory, 10, 1000, sensor="nisar")
-        self.assertEqual(result, {"names": ["NISAR_L2_PR_GCOV_TEST"], "count": 1})
+        self.assertEqual(result, {"names": ["NISAR_L2_PR_GCOV_TEST"],
+                                  "count": 1, "failed_dates": []})
         self.assertEqual(query.call_count, 4)
         self.assertEqual(query.call_args.args[:2], ("2026-07-08", "2026-07-08"))
 
@@ -414,7 +456,8 @@ class FloodSearchTests(unittest.TestCase):
 
     def test_nisar_search_only_needs_no_credentials_or_desert_vrt(self):
         self.configure_daily_main()
-        search = self.ns["search_flood_images_by_date_range"] = Mock(return_value={"names": [], "count": 0})
+        search = self.ns["search_flood_images_by_date_range"] = Mock(
+            return_value={"names": [], "count": 0, "failed_dates": []})
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
             argv = [str(SOURCE), "--sensor", "nisar", "--search-only", "--start-date", "2026-07-07",
                     "--end-date", "2026-07-08", "--work-directory", directory]
@@ -429,6 +472,23 @@ class FloodSearchTests(unittest.TestCase):
                   contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit)):
                 self.ns["main"]()
             search.assert_not_called()
+
+    def test_search_only_log_summarizes_failures_without_printing_names(self):
+        self.configure_daily_main()
+        self.ns["search_flood_images_by_date_range"] = Mock(return_value={
+            "names": ["S1_TEST_SCENE"], "count": 1, "failed_dates": ["2020-05-16"]})
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "images.json"
+            argv = [str(SOURCE), "--search-only", "--names-only", "--start-date", "2020-05-15",
+                    "--end-date", "2020-05-16", "--work-directory", directory,
+                    "--output-json", str(output)]
+            log = io.StringIO()
+            with patch.object(sys, "argv", argv), contextlib.redirect_stdout(log):
+                self.assertEqual(self.ns["main"](), 1)
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), ["S1_TEST_SCENE"])
+            self.assertIn("1 unique images", log.getvalue())
+            self.assertIn("2020-05-16", log.getvalue())
+            self.assertNotIn("S1_TEST_SCENE", log.getvalue())
 
 
 if __name__ == "__main__":
