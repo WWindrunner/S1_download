@@ -11,8 +11,8 @@ Sensor/product and download provider are independent parameters:
 
 | Sensor | Product type | Download source | Processing |
 | --- | --- | --- | --- |
-| `s1` (default) | `GRD` (default for s1) | `cdse` (default for s1) | CDSE download + SNAP |
-| `s1` | `GRD` | `asf` | Submit Sentinel-1 HyP3 RTC jobs |
+| `s1` (default) | `GRD` (default for s1) | `asf` (default) | Submit Sentinel-1 HyP3 RTC jobs (all scenes concurrently) |
+| `s1` | `GRD` | `cdse` | CDSE download + SNAP |
 | `nisar` | `GCOV` (default for nisar) | `asf` (default for nisar) | Download existing HDF5, export backscatter and calculate masks |
 
 Unsupported combinations are rejected before searching/downloading.
@@ -308,16 +308,15 @@ legacy and explicit calling forms use the same scene-prefixed output names.
 
 ## Daily flood-warning sensor selection
 
-`execute_flood_warning.sh` defaults to `SENSOR=s1`. Without any new settings,
-existing daily submissions still search Sentinel-1 and use CDSE + SNAP;
-`DOWNLOAD_SOURCE=asf` still selects Sentinel-1 HyP3 RTC as before.
-Set the single new sensor variable to search and process NISAR GCOV instead:
+`execute_flood_warning.sh` defaults to `SENSOR=s1` with ASF HyP3 RTC
+(`DOWNLOAD_SOURCE=asf`); set `DOWNLOAD_SOURCE=cdse` for CDSE + SNAP.
+Set the sensor variable to search and process NISAR GCOV instead:
 
 ```bash
-# Existing daily job, unchanged:
+# Daily Sentinel-1 job (ASF HyP3 RTC):
 sbatch execute_flood_warning.sh
-# Existing Sentinel-1 ASF selection, unchanged:
-sbatch --export=ALL,DOWNLOAD_SOURCE=asf execute_flood_warning.sh
+# Sentinel-1 via CDSE + SNAP (requires CDSE_USERNAME/CDSE_PASSWORD):
+sbatch --export=ALL,DOWNLOAD_SOURCE=cdse execute_flood_warning.sh
 # NISAR GCOV: ASF is selected automatically when DOWNLOAD_SOURCE is unset.
 sbatch --export=ALL,SENSOR=nisar execute_flood_warning.sh
 # Explicit source (also overrides any inherited DOWNLOAD_SOURCE=cdse):
@@ -532,24 +531,32 @@ for checkpoints; the legacy flood-warning runner removes them after success.
 
 ## Download channel
 
-Existing Sentinel-1 commands continue to use Copernicus Data Space + SNAP by default.
-Use `--download-source cdse` to select that path explicitly, or
-`--download-source asf` for ASF HyP3 RTC. Catalogue searching remains on CDSE
-and does not require authentication. ASF authentication uses Earthdata
-`~/.netrc`, independently of the positional CDSE credentials.
+Sentinel-1 commands use ASF HyP3 RTC by default. Use `--download-source cdse`
+(or `DOWNLOAD_SOURCE=cdse` in the shell scripts) for Copernicus Data Space + SNAP.
+Catalogue searching remains on CDSE and does not require authentication. ASF
+authentication uses Earthdata `~/.netrc`, independently of the CDSE credentials.
+
+With ASF, `SAR_download_process.py` and the daily workflow first submit RTC jobs
+for all selected scenes, so ASF processes them concurrently. Each job is
+downloaded and converted as soon as it succeeds (up to 4 at a time), while the
+others are still processing. Masks are then generated scene by scene. A failed
+submission, HyP3 job, download or conversion only marks that scene as failed;
+the other scenes continue. Reruns skip scenes whose ASF outputs already exist
+and reuse a pending or unexpired HyP3 job with identical options instead of
+resubmitting, so an interrupted run does not spend credits twice.
 
 ```bash
-# Existing invocation, unchanged:
-python Sentinel_1_specific_name_download_process.py "$SCENE" ./data "$CDSE_USERNAME" "$CDSE_PASSWORD"
-# ASF does not require the two CDSE credential arguments:
-python Sentinel_1_specific_name_download_process.py "$SCENE" ./data --download-source asf
+# CDSE + SNAP with positional credentials:
+python Sentinel_1_specific_name_download_process.py "$SCENE" ./data "$CDSE_USERNAME" "$CDSE_PASSWORD" --download-source cdse
+# ASF (default) does not require CDSE credentials:
+python Sentinel_1_specific_name_download_process.py "$SCENE" ./data
 # Direct ASF adapter (also accepts comma-separated scene names):
 python Sentinel_1_specific_name_ASF.py "$SCENE" ./data
 # Daily warning workflow:
 python Sentinel_1_ESA_search_download_process_chain_v4.py --desert-mask-vrt /path/desert.vrt --download-source asf
-# Shell/Slurm entry points (default DOWNLOAD_SOURCE=cdse):
-DOWNLOAD_SOURCE=asf bash execute.sh
-sbatch --export=ALL,DOWNLOAD_SOURCE=asf execute_flood_warning.sh
+# Shell/Slurm entry points (default DOWNLOAD_SOURCE=asf):
+DOWNLOAD_SOURCE=cdse bash execute.sh
+sbatch --export=ALL,DOWNLOAD_SOURCE=cdse execute_flood_warning.sh
 ```
 
 Install the optional ASF dependency into the processing environment with

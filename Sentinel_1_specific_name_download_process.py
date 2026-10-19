@@ -146,7 +146,7 @@ def main(argv=None):
     parser.add_argument("output_folder")
     parser.add_argument("username", nargs="?", default="")
     parser.add_argument("password", nargs="?", default="")
-    parser.add_argument("--download-source", choices=("cdse", "asf"), default="cdse")
+    parser.add_argument("--download-source", choices=("cdse", "asf"), default="asf")
     args = parser.parse_args(argv)
     S1names = [name.strip().removesuffix(".SAFE") for name in args.names.split(",") if name.strip()]
     if not S1names:
@@ -154,8 +154,7 @@ def main(argv=None):
     folder = os.path.abspath(os.path.expanduser(args.output_folder))
     if args.download_source == "asf":
         from Sentinel_1_specific_name_ASF import download_and_process
-        download_and_process(S1names, folder)
-        return 0
+        return 1 if download_and_process(S1names, folder) else 0
     username, password = args.username, args.password
     if not username or not password:
         parser.error("Copernicus Data Space username and password are required")

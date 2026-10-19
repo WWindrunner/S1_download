@@ -64,7 +64,8 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sensor", choices=("s1", "nisar"), default="s1")
     parser.add_argument("--product-type", type=str.upper, help="Default: GRD for s1, GCOV for nisar; GUNW is unsupported")
-    parser.add_argument("--download-source", choices=("cdse", "asf"), help="Default: cdse for s1, asf for nisar")
+    parser.add_argument("--download-source", choices=("cdse", "asf"), default="asf",
+                        help="s1: asf (HyP3 RTC, default) or cdse (SNAP); nisar: asf")
     parser.add_argument("--output-dir", default="data")
     inputs = parser.add_mutually_exclusive_group()
     inputs.add_argument("--names", nargs="+", help="Exact product names (space- or comma-separated)")
@@ -95,7 +96,6 @@ def build_parser():
 
 def validate_args(parser, args):
     args.product_type = args.product_type or ("GCOV" if args.sensor == "nisar" else "GRD")
-    args.download_source = args.download_source or ("asf" if args.sensor == "nisar" else "cdse")
     supported = {("s1", "GRD", "cdse"), ("s1", "GRD", "asf"), ("nisar", "GCOV", "asf")}
     if (args.sensor, args.product_type, args.download_source) not in supported:
         parser.error("Supported combinations: s1/GRD/cdse, s1/GRD/asf, nisar/GCOV/asf. GUNW needs a separate interferometric workflow.")
@@ -176,8 +176,19 @@ def main(argv=None):
         return 1
 
     failures = []
+    # Run every ASF RTC job concurrently up front; each scene's backscatter stage then
+    # finds its outputs. A failed job only excludes its own scene.
+    asf_failures = {}
+    if args.sensor == "s1" and args.download_source == "asf":
+        try:
+            from Sentinel_1_specific_name_ASF import download_and_process
+            asf_failures = download_and_process(names, args.output_dir)
+        except Exception as exc:
+            asf_failures = {name: f"ASF batch failed: {exc}" for name in names}
     for name in names:
         try:
+            if name in asf_failures:
+                raise RuntimeError(asf_failures[name])
             if args.sensor == "s1":
                 process_sentinel(name, args)
             else:

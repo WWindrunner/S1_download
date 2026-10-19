@@ -19,7 +19,7 @@ set -o pipefail
 
 sensor="${SENSOR:-s1}"
 case "$sensor" in
-    s1) download_source="${DOWNLOAD_SOURCE:-cdse}" ;;
+    s1) download_source="${DOWNLOAD_SOURCE:-asf}" ;;
     nisar)
         download_source="${DOWNLOAD_SOURCE:-asf}"
         if [ "$download_source" != "asf" ]; then

@@ -723,12 +723,10 @@ def incidence_process(VV_VH_incidence_path):
             a=1
 
 
-def run_new_processing_chain(product_name, output_dir, desert_mask_vrt, download_source=None, sensor="s1"):
+def run_new_processing_chain(product_name, output_dir, desert_mask_vrt, download_source="asf", sensor="s1"):
     """Run the maintained per-product workflow and its ancillary masks."""
     if sensor not in ("s1", "nisar"):
         raise ValueError(f"Unknown sensor: {sensor}")
-    if download_source is None:
-        download_source = "asf" if sensor == "nisar" else "cdse"
     if download_source not in ("cdse", "asf"):
         raise ValueError(f"Unknown download source: {download_source}")
     if sensor == "nisar":
@@ -858,10 +856,9 @@ def main():
     parser.add_argument("--window-size", type=int, default=10)
     parser.add_argument("--area-thresholds", type=float, default=1000)
     parser.add_argument("--sensor", choices=("s1", "nisar"), default="s1")
-    parser.add_argument("--download-source", choices=("cdse", "asf"), default=None,
-                        help="Default: cdse for Sentinel-1, asf for NISAR.")
+    parser.add_argument("--download-source", choices=("cdse", "asf"), default="asf",
+                        help="Sentinel-1: asf (HyP3 RTC, default) or cdse (SNAP); NISAR: asf.")
     args = parser.parse_args()
-    args.download_source = args.download_source or ("asf" if args.sensor == "nisar" else "cdse")
     if args.sensor == "nisar" and args.download_source != "asf":
         parser.error("NISAR GCOV requires --download-source asf")
     if args.search_only:
@@ -986,10 +983,21 @@ def main():
         print(f"No images on {glofas_date_name}")
         # shutil.rmtree(workfolder)
     else:
+        # Run all ASF RTC jobs concurrently; a failed job only skips its own scene.
+        asf_failures = {}
+        if args.sensor == "s1" and args.download_source == "asf":
+            names = [n.removesuffix(".SAFE") for n in df["Name"]]
+            try:
+                from Sentinel_1_specific_name_ASF import download_and_process
+                asf_failures = download_and_process(names, processed_images_dir)
+            except Exception as e:
+                asf_failures = {n: f"ASF batch failed: {e}" for n in names}
 
         for idx, row in df.iterrows():
             name = row["Name"]
             try:
+                if name.removesuffix(".SAFE") in asf_failures:
+                    raise RuntimeError(asf_failures[name.removesuffix(".SAFE")])
                 start_time_each_image = datetime.datetime.now()
                 if args.sensor == "s1":
                     run_new_processing_chain(name, processed_images_dir, desert_mask_vrt, args.download_source)

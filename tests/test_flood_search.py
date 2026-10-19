@@ -407,8 +407,9 @@ class FloodSearchTests(unittest.TestCase):
         self.ns["run_new_processing_chain"] = Mock()
 
     def test_daily_main_default_and_nisar_routing_preserve_legacy_layout(self):
-        for sensor in ("s1", "nisar"):
-            with self.subTest(sensor=sensor), tempfile.TemporaryDirectory() as directory:
+        for sensor, source in (("s1", None), ("s1", "cdse"), ("nisar", None)):
+            with self.subTest(sensor=sensor, source=source), tempfile.TemporaryDirectory() as directory, \
+                    patch("Sentinel_1_specific_name_ASF.download_and_process", return_value={}) as asf_batch:
                 self.configure_daily_main()
                 name = "scene.SAFE" if sensor == "s1" else "NISAR_L2_PR_GCOV_TEST"
                 data = pd.DataFrame([dict(Id="a", Name=name), dict(Id="a", Name=name)])
@@ -418,9 +419,10 @@ class FloodSearchTests(unittest.TestCase):
                 vrt.touch()
                 env = dict(RAPID_PROJECT_DIR=directory)
                 argv = [str(SOURCE), "--desert-mask-vrt", str(vrt)]
-                if sensor == "s1":
+                if source == "cdse":
                     env.update(CDSE_USERNAME="user", CDSE_PASSWORD="password")
-                else:
+                    argv += ["--download-source", "cdse"]
+                elif sensor == "nisar":
                     argv += ["--sensor", "nisar"]
                 with patch.dict(os.environ, env, clear=True), patch.object(sys, "argv", argv):
                     self.assertEqual(self.ns["main"](), None if sensor == "s1" else 0)
@@ -435,8 +437,14 @@ class FloodSearchTests(unittest.TestCase):
                 self.assertEqual(manifest.read_text().strip(), str(output) + os.sep)
                 process = self.ns["run_new_processing_chain"]
                 if sensor == "s1":
-                    process.assert_called_once_with(name, str(output), str(vrt), "cdse")
+                    # Sentinel-1 defaults to ASF and submits the whole batch up front.
+                    process.assert_called_once_with(name, str(output), str(vrt), source or "asf")
+                    if source == "cdse":
+                        asf_batch.assert_not_called()
+                    else:
+                        asf_batch.assert_called_once_with(["scene"], str(output))
                 else:
+                    asf_batch.assert_not_called()
                     process.assert_called_once_with(name, str(output), str(vrt), "asf", sensor="nisar")
                     self.assertFalse((day_root / "Sentinel_1").exists())
                     self.assertEqual(self.ns["username"], "")

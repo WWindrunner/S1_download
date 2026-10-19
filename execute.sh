@@ -12,14 +12,14 @@ path="/tank/data/SFS/xinyis/FS650/maopuxu/lab_2/past_events/20260616_mask"
 desert_mask_vrt="/path/to/global_desert_mask.vrt"
 
 # Sensor/product and download provider are separate settings.
-# s1/GRD: cdse (SNAP) or asf (HyP3 RTC); nisar/GCOV: asf (existing H5).
+# s1/GRD: asf (HyP3 RTC, default) or cdse (SNAP); nisar/GCOV: asf (existing H5).
 sensor="${SENSOR:-s1}"
 if [ "$sensor" = "nisar" ]; then
     product_type="${PRODUCT_TYPE:-GCOV}"
     download_source="${DOWNLOAD_SOURCE:-asf}"
 else
     product_type="${PRODUCT_TYPE:-GRD}"
-    download_source="${DOWNLOAD_SOURCE:-cdse}"
+    download_source="${DOWNLOAD_SOURCE:-asf}"
 fi
 
 # Required only for Sentinel-1 CDSE; ASF uses Earthdata ~/.netrc.
