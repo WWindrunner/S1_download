@@ -26,9 +26,8 @@ def process_sentinel(name, args):
                 "--download-source", source)
         paths = [directory / "Gamma0_VV.tif", directory / "Gamma0_VH.tif"]
         if source == "asf":
-            paths += [directory / f"{name}_DEM.tif", directory / f"{name}_LIA.tif",
-                      directory / f"{name}_localIncidenceAngle.tif",
-                      directory / "incidenceAngleFromEllipsoid.tif"]
+            paths += [directory / f"{name}_DEM.tif", directory / f"{name}_localIncidenceAngle.tif",
+                      directory / "incidenceAngleFromEllipsoid.tif", directory / f"{name}_ls_map.tif"]
         else:
             angles = list(directory.glob("*incidenceAngleFromEllipsoid.tif"))
             if len(angles) != 1:
@@ -40,15 +39,15 @@ def process_sentinel(name, args):
                                    code=implementation_stamp("Sentinel_1_specific_name_download_process.py",
                                                              "Sentinel_1_specific_name_ASF.py")), backscatter)
     reference = directory / "Gamma0_VV.tif"
-    if source == "cdse":
-        angle = next(directory.glob("*incidenceAngleFromEllipsoid.tif"))
+    # Both sources have the ellipsoid incidence angle and a DEM on the Gamma0 grid.
+    angle = next(directory.glob("*incidenceAngleFromEllipsoid.tif"))
 
-        def lia():
-            command("cal_LIA.py", name, directory, "--incidence-angle", angle, "--metadata-dir", directory)
-            return [directory / f"{name}_LIA.tif"]
+    def lia():
+        command("cal_LIA.py", name, directory, "--incidence-angle", angle, "--metadata-dir", directory)
+        return [directory / f"{name}_LIA.tif"]
 
-        stages.run("lia", dict(angle=file_stamp(angle), dem=[file_stamp(p) for p in directory.glob("*_DEM.tif")],
-                               code=implementation_stamp("cal_LIA.py")), lia, reference)
+    stages.run("lia", dict(angle=file_stamp(angle), dem=[file_stamp(p) for p in directory.glob("*_DEM.tif")],
+                           code=implementation_stamp("cal_LIA.py")), lia, reference)
     from Desert_mask import generate_desert_mask
     from Snow_detect import generate_s2_masks
 

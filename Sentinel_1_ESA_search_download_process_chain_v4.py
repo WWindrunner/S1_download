@@ -765,21 +765,20 @@ def run_new_processing_chain(product_name, output_dir, desert_mask_vrt, download
         )
 
     ancillary_stages = []
-    if download_source == "cdse":
-        incidence_paths = glob.glob(
-            os.path.join(product_dir, "*incidenceAngleFromEllipsoid.tif")
+    # SNAP and ASF both write the ellipsoid incidence angle and a DEM for cal_LIA.py.
+    incidence_paths = glob.glob(
+        os.path.join(product_dir, "*incidenceAngleFromEllipsoid.tif")
+    )
+    if len(incidence_paths) != 1:
+        raise RuntimeError(
+            "Expected exactly one ellipsoid incidence-angle raster, found "
+            f"{len(incidence_paths)}"
         )
-        if len(incidence_paths) != 1:
-            raise RuntimeError(
-                "Expected exactly one ellipsoid incidence-angle raster, found "
-                f"{len(incidence_paths)}"
-            )
-        ancillary_stages.append((
-            "local incidence angle", "cal_LIA.py",
-            [s1name, product_dir, "--incidence-angle", incidence_paths[0],
-             "--metadata-dir", product_dir],
-        ))
-    # ASF already writes the same LIA exclusion-mask interface from its local angle.
+    ancillary_stages.append((
+        "local incidence angle", "cal_LIA.py",
+        [s1name, product_dir, "--incidence-angle", incidence_paths[0],
+         "--metadata-dir", product_dir],
+    ))
     ancillary_stages.append((
         "snow and cloud masks", "Snow_detect.py",
         [s1name, os.path.join(product_dir, "Gamma0_VV.tif"), product_dir],

@@ -77,20 +77,22 @@ class DownloadTests(unittest.TestCase):
                 values = np.ones((2, 3), dtype="float32")
                 if key == "angle":
                     values[:] = [[np.deg2rad(40), np.deg2rad(60), -9999]] * 2
-                if key == "ls":  # second row: shadow (1 + 8 + 16) at a folded 40 degrees
-                    values[:] = [[1, 1, 1], [25, 1, 1]]
+                if key == "ls":  # 1 + 8 + 16: tested, look < -slope, shadow
+                    values = np.array([[1, 1, 1], [25, 1, 0]], dtype="uint8")
                 products[key] = root / (key + ".tif")
-                with rasterio.open(products[key], "w", **dict(profile, nodata=0) if key == "ls" else profile) as target:
+                with rasterio.open(products[key], "w", **dict(profile, dtype=values.dtype.name,
+                                   nodata=0 if key == "ls" else -9999)) as target:
                     target.write(values, 1)
             # constant 60 degree ellipsoid incidence around the scene
             points = np.array([[-96, 41, 60], [-94, 41, 60], [-96, 39, 60], [-94, 39, 60]], dtype=float)
-            asf.normalize_products(products, root, "scene", incidence_points=points)
+            asf.normalize_products(products, root, "scene", incidence_points=points,
+                                   manifest=b"<pass>ASCENDING</pass>")
             with rasterio.open(root / "Gamma0_VV.tif") as vv, rasterio.open(
                 root / "Gamma0_VH.tif"
             ) as vh, rasterio.open(root / "scene_DEM.tif") as dem, rasterio.open(
-                root / "scene_LIA.tif"
-            ) as lia:
-                for raster in (vh, dem, lia):
+                root / "scene_localIncidenceAngle.tif"
+            ) as local, rasterio.open(root / "incidenceAngleFromEllipsoid.tif") as inc:
+                for raster in (vh, dem, local, inc):
                     self.assertEqual(raster.transform, vv.transform)
                     self.assertEqual(raster.shape, vv.shape)
                     self.assertEqual(raster.crs.to_epsg(), 4326)
@@ -99,13 +101,15 @@ class DownloadTests(unittest.TestCase):
                 np.testing.assert_allclose(vv.read(1)[:2, :3], 1)  # not normalized here
                 np.testing.assert_allclose(vh.read(1)[:2, :3], 1)
                 np.testing.assert_allclose(dem.read(1)[:2, :3], 1)
-                self.assertEqual(lia.dtypes, ("uint8",))
-                self.assertEqual(lia.nodata, 255)
-                np.testing.assert_array_equal(lia.read(1)[:2, :3], [[0, 1, 255], [1, 1, 255]])
-                self.assertTrue(np.all(lia.read(1)[~np.isfinite(vv.read(1))] == 255))
-            with rasterio.open(root / "incidenceAngleFromEllipsoid.tif") as inc:
-                self.assertEqual(inc.transform, vv.transform)
+                # HyP3 radians -> degrees; the LIA mask itself comes from cal_LIA.py
+                np.testing.assert_allclose(local.read(1)[:2, :2], [[40, 60]] * 2, rtol=1e-5)
+                self.assertTrue(np.all(np.isnan(local.read(1)[:2, 2])))
                 np.testing.assert_allclose(inc.read(1)[:2, :3], 60, rtol=1e-6)
+            with rasterio.open(root / "scene_ls_map.tif") as ls:
+                self.assertEqual((ls.transform, ls.shape, ls.dtypes), (vv.transform, vv.shape, ("uint8",)))
+                np.testing.assert_array_equal(ls.read(1)[:2, :3], [[1, 1, 1], [25, 1, 0]])
+            self.assertFalse((root / "scene_LIA.tif").exists())
+            self.assertEqual((root / "scene_manifest.safe").read_bytes(), b"<pass>ASCENDING</pass>")
 
     def fake_hyp3(self, outcomes, existing=()):
         """HyP3 mock: each granule's job runs one poll, then takes its outcome."""
@@ -238,8 +242,8 @@ class DownloadTests(unittest.TestCase):
                 for name in ("Gamma0_VV.tif", "Gamma0_VH.tif", "scene_desert.tif", "scene_LIA.tif",
                              "scene_ice.tif", "scene_cloud.tif", "scene_DEM.tif"):
                     (scene / name).touch()
-                if channel == "cdse":
-                    (scene / "scene_incidenceAngleFromEllipsoid.tif").touch()
+                (scene / ("scene_incidenceAngleFromEllipsoid.tif" if channel == "cdse"
+                          else "incidenceAngleFromEllipsoid.tif")).touch()
                 runner = Mock()
                 ns = dict(os=os, glob=glob, shutil=shutil, sys=sys, subprocess=runner,
                           SCRIPT_DIR=str(ROOT), username="", password="")
@@ -251,7 +255,7 @@ class DownloadTests(unittest.TestCase):
                 commands = [call.args[0] for call in runner.run.call_args_list]
                 self.assertEqual(commands[0][-2:], ["--download-source", channel])
                 scripts = [Path(command[1]).name for command in commands]
-                self.assertEqual("cal_LIA.py" in scripts, channel == "cdse")
+                self.assertIn("cal_LIA.py", scripts)  # both sources have the ellipsoid angle
                 self.assertIn("Snow_detect.py", scripts)
                 self.assertTrue((scene / "scene_DEM.tif").exists())
 

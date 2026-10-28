@@ -294,6 +294,10 @@ if S1_angle_path.endswith(angle_suffix):
 else:
     snap_dem_path = None
 
+if snap_dem_path is None or not os.path.isfile(snap_dem_path):
+    # ASF RTC: incidenceAngleFromEllipsoid.tif next to the HyP3 <S1_NAME>_DEM.tif
+    dems = glob.glob(os.path.join(os.path.dirname(S1_angle_path), "*_DEM.tif"))
+    snap_dem_path = dems[0] if len(dems) == 1 else None
 using_snap_dem = snap_dem_path is not None and os.path.isfile(snap_dem_path)
 if using_snap_dem:
     print(f"Reusing SNAP DEM: {snap_dem_path}")

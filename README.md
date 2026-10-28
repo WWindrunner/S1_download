@@ -213,11 +213,18 @@ For each Sentinel-1 product name, the workflow runs the following steps:
    - With `--download-source asf` (HyP3 RTC), HyP3 only provides the local
      incidence angle. `incidenceAngleFromEllipsoid.tif` (the default input
      name of RAPID's `run_scenes.sh`) is interpolated from the geolocation
-     grid of the GRD annotation, read remotely from the ASF GRD zip (~1.6 MB, Earthdata `~/.netrc`, needs
-     `remotezip`). `Gamma0_VV/VH.tif` are left as HyP3 RTC Gamma0; pass the
-     angle to RAPID with `--inc_angle_path` to normalize. `<S1_NAME>_LIA.tif`
-     also excludes HyP3 `_ls_map` shadow pixels (values with 8 or 16), so
-     shadow is excluded even where the local incidence angle is folded.
+     grid of the GRD annotation, read remotely from the ASF GRD zip
+     (~1.6 MB, Earthdata `~/.netrc`, needs `remotezip`), together with
+     `<S1_NAME>_manifest.safe` for the orbit direction.
+   - `Gamma0_VV/VH.tif` are left as HyP3 RTC Gamma0; pass the angle to RAPID
+     with `--inc_angle_path` to normalize.
+   - `<S1_NAME>_LIA.tif` is made by `cal_LIA.py` from this angle and the HyP3
+     `<S1_NAME>_DEM.tif`, as for SNAP (HyP3's own local incidence angle is kept
+     as `<S1_NAME>_localIncidenceAngle.tif` but not used for the mask).
+   - `<S1_NAME>_ls_map.tif` keeps the HyP3 layover-shadow map (uint8 sums of
+     1 tested, 2 look < slope, 4 layover, 8 look < -slope, 16 shadow; 0 = not
+     tested). It is not used in any mask; code 16 also marks shadow cast by
+     distant terrain, which the local slope in the LIA does not capture.
 2. `Desert_mask.py`
    - Clips and reprojects the external global desert-mask VRT to the
      Sentinel-1 grid.
