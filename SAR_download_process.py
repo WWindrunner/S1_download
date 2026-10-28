@@ -27,7 +27,8 @@ def process_sentinel(name, args):
         paths = [directory / "Gamma0_VV.tif", directory / "Gamma0_VH.tif"]
         if source == "asf":
             paths += [directory / f"{name}_DEM.tif", directory / f"{name}_LIA.tif",
-                      directory / f"{name}_localIncidenceAngle.tif"]
+                      directory / f"{name}_localIncidenceAngle.tif",
+                      directory / f"{name}_incidenceAngleFromEllipsoid.tif"]
         else:
             angles = list(directory.glob("*incidenceAngleFromEllipsoid.tif"))
             if len(angles) != 1:

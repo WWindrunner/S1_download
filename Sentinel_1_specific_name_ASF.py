@@ -1,7 +1,11 @@
 """ASF HyP3 RTC adapter for the maintained Sentinel-1 processing chain.
 
 Authentication uses Earthdata credentials in ~/.netrc. Importing this module
-never submits jobs. HyP3 local incidence angles are radians, not ellipsoid angles.
+never submits jobs. HyP3 local incidence angles are radians, not ellipsoid angles;
+the ellipsoid incidence angle is interpolated from the geolocation grid of the GRD
+annotation (the source of SNAP's incidenceAngleFromEllipsoid), read remotely from
+the ASF GRD zip. Gamma0 is left as HyP3 RTC; RAPID normalizes it with this angle
+(--inc_angle_path).
 """
 import argparse
 from pathlib import Path
@@ -13,7 +17,7 @@ import zipfile
 def extract_products(archives, directory):
     """Extract only recognized rasters; reject missing or ambiguous layers."""
     suffixes = {"vv": "_vv.tif", "vh": "_vh.tif",
-                "angle": "_inc_map.tif", "dem": "_dem.tif"}
+                "angle": "_inc_map.tif", "dem": "_dem.tif", "ls": "_ls_map.tif"}
     products = {}
     for archive in archives:
         with zipfile.ZipFile(archive) as package:
@@ -33,11 +37,75 @@ def extract_products(archives, directory):
     return products
 
 
-def normalize_products(products, product_dir, granule):
-    """Write float32 gamma0/DEM and uint8 LIA on one WGS84 grid."""
+def annotation_points(granule):
+    """(lon, lat, ellipsoid incidence deg) of the GRD annotation geolocation grid."""
+    import netrc
+    import xml.etree.ElementTree as ET
+
+    import asf_search as asf
+    import numpy as np
+
+    def read():
+        user, _, password = netrc.netrc().authenticators("urs.earthdata.nasa.gov")
+        session = asf.ASFSession().auth_with_creds(user, password)
+        products = [p for p in asf.granule_search([granule])
+                    if p.properties["processingLevel"].startswith("GRD")]
+        if not products:
+            raise ValueError(f"GRD not found in the ASF catalogue: {granule}")
+        # Only the annotation (~1.6 MB) is read from the GRD zip; one polarization suffices.
+        with products[0].remotezip(session) as package:
+            names = [n for n in package.namelist() if "/annotation/" in n and n.endswith(".xml")
+                     and "/calibration/" not in n and "/rfi/" not in n]
+            if not names:
+                raise ValueError(f"No annotation XML in the GRD zip of {granule}")
+            return package.read(sorted(names)[0])
+
+    root = ET.fromstring(retry_transient(read, f"ASF annotation for {granule}"))
+    points = np.array([[float(p.find(k).text) for k in ("longitude", "latitude", "incidenceAngle")]
+                       for p in root.iter("geolocationGridPoint")])
+    if len(points) < 3:
+        raise ValueError(f"Annotation geolocation grid too small for {granule}")
+    return points
+
+
+def ellipsoid_incidence(points, transform, width, height, step=50):
+    """Interpolate annotation points onto a north-up EPSG:4326 grid (degrees)."""
+    import numpy as np
+    from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+
+    # The angle is smooth: interpolate every `step` pixels, then bilinear.
+    rows = np.unique(np.append(np.arange(0, height, step), height - 1))
+    cols = np.unique(np.append(np.arange(0, width, step), width - 1))
+    lon = transform.c + (cols + 0.5) * transform.a
+    lat = transform.f + (rows + 0.5) * transform.e
+    glon, glat = np.meshgrid(lon, lat)
+    nodes = LinearNDInterpolator(points[:, :2], points[:, 2])(glon, glat)
+    gap = np.isnan(nodes)  # outside the point hull, e.g. scene edges
+    nodes[gap] = NearestNDInterpolator(points[:, :2], points[:, 2])(glon[gap], glat[gap])
+    # separable linear interpolation: along columns, then along rows
+    across = np.array([np.interp(np.arange(width), cols, row) for row in nodes], dtype="float32")
+    out = np.empty((height, width), dtype="float32")
+    for c0 in range(0, width, 4096):
+        part = across[:, c0:c0 + 4096]
+        out[:, c0:c0 + 4096] = np.array([np.interp(np.arange(height), rows, col)
+                                         for col in part.T], dtype="float32").T
+    return out
+
+
+def normalize_products(products, product_dir, granule, incidence_points=None):
+    """Write float32 gamma0/DEM/angles and uint8 LIA on one WGS84 grid.
+
+    Gamma0 is not normalized here: the ellipsoid incidence angle is written for
+    RAPID's --inc_angle_path. The LIA mask excludes LIA > 50
+    degrees and HyP3 layover-shadow shadow flags (8, 16), so shadow is excluded even
+    where the local incidence angle is folded below 90 degrees.
+    """
     import numpy as np
     import rasterio
     from rasterio.warp import calculate_default_transform, reproject, Resampling
+
+    if incidence_points is None:
+        incidence_points = annotation_points(granule)
 
     product_dir = Path(product_dir)
     with rasterio.open(products["vv"]) as source:
@@ -49,6 +117,13 @@ def normalize_products(products, product_dir, granule):
                    nodata=float("nan"), compress="deflate", tiled=True)
     names = {"vv": "Gamma0_VV.tif", "vh": "Gamma0_VH.tif",
              "dem": f"{granule}_DEM.tif", "angle": f"{granule}_localIncidenceAngle.tif"}
+    with rasterio.open(products["ls"]) as source:
+        ls = np.zeros((height, width), dtype="uint8")  # 0 = not tested
+        reproject(source.read(1), ls, src_transform=source.transform, src_crs=source.crs,
+                  dst_transform=transform, dst_crs=profile["crs"], src_nodata=0, dst_nodata=0,
+                  resampling=Resampling.nearest)
+        shadow = (ls & (8 | 16)) > 0
+    inc = ellipsoid_incidence(incidence_points, transform, width, height)
     for key, filename in names.items():
         with rasterio.open(products[key]) as source:
             if source.crs is None or source.count != 1:
@@ -64,19 +139,27 @@ def normalize_products(products, product_dir, granule):
                       dst_nodata=np.nan, resampling=Resampling.bilinear)
         if not np.isfinite(destination).any():
             raise ValueError(f"ASF raster has no valid pixels: {products[key]}")
+        if key == "vv":
+            valid_vv = np.isfinite(destination)
         with rasterio.open(product_dir / filename, "w", **profile) as target:
             target.write(destination, 1)
             target.update_tags(download_source="asf", processing="HyP3 RTC")
         if key == "angle":
             mask = np.full(destination.shape, 255, dtype="uint8")
             valid = np.isfinite(destination)
-            mask[valid] = (destination[valid] > 50).astype("uint8")
+            mask[valid] = ((destination[valid] > 50) | shadow[valid]).astype("uint8")
             with rasterio.open(product_dir / f"{granule}_LIA.tif", "w",
                                **dict(profile, dtype="uint8", nodata=255)) as target:
                 target.write(mask, 1)
-                target.set_band_description(1, "local_incidence_angle_greater_than_50_degrees")
+                target.set_band_description(1, "local_incidence_angle_greater_than_50_degrees_or_shadow")
                 target.update_tags(mask_semantics="0=keep,1=exclude,255=nodata",
-                                   lia_threshold_degrees=50, download_source="asf")
+                                   lia_threshold_degrees=50, download_source="asf",
+                                   shadow="HyP3 ls_map values 8 or 16 also excluded")
+    inc[~valid_vv] = np.nan
+    with rasterio.open(product_dir / f"{granule}_incidenceAngleFromEllipsoid.tif", "w", **profile) as target:
+        target.write(inc, 1)
+        target.set_band_description(1, "ellipsoid_incidence_angle_degrees")
+        target.update_tags(download_source="asf", source="S1 annotation geolocationGrid")
 
 
 RTC_OPTIONS = dict(radiometry="gamma0", scale="power", resolution=20,
@@ -85,7 +168,8 @@ RTC_OPTIONS = dict(radiometry="gamma0", scale="power", resolution=20,
 
 def output_names(granule):
     return ["Gamma0_VV.tif", "Gamma0_VH.tif", f"{granule}_DEM.tif",
-            f"{granule}_localIncidenceAngle.tif", f"{granule}_LIA.tif"]
+            f"{granule}_localIncidenceAngle.tif", f"{granule}_LIA.tif",
+            f"{granule}_incidenceAngleFromEllipsoid.tif"]
 
 
 def outputs_complete(product_dir, granule):

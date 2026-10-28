@@ -58,7 +58,7 @@ class DownloadTests(unittest.TestCase):
                 for suffix in ("VV", "VH", "dem", "inc_map", "ls_map", "rgb"):
                     package.writestr(f"../../nested/product_{suffix}.tif", b"raster")
             products = asf.extract_products([archive], folder)
-            self.assertEqual(set(products), {"vv", "vh", "dem", "angle"})
+            self.assertEqual(set(products), {"vv", "vh", "dem", "angle", "ls"})
             self.assertTrue(all(p.parent == Path(folder) for p in products.values()))
             with self.assertRaises(ValueError):
                 asf.extract_products([archive, archive], folder)
@@ -73,14 +73,18 @@ class DownloadTests(unittest.TestCase):
                            dtype="float32", crs="EPSG:4326",
                            transform=from_origin(-95, 40, spacing, spacing), nodata=-9999)
             products = {}
-            for key in ("vv", "vh", "dem", "angle"):
+            for key in ("vv", "vh", "dem", "angle", "ls"):
                 values = np.ones((2, 3), dtype="float32")
                 if key == "angle":
                     values[:] = [[np.deg2rad(40), np.deg2rad(60), -9999]] * 2
+                if key == "ls":  # second row: shadow (1 + 8 + 16) at a folded 40 degrees
+                    values[:] = [[1, 1, 1], [25, 1, 1]]
                 products[key] = root / (key + ".tif")
-                with rasterio.open(products[key], "w", **profile) as target:
+                with rasterio.open(products[key], "w", **dict(profile, nodata=0) if key == "ls" else profile) as target:
                     target.write(values, 1)
-            asf.normalize_products(products, root, "scene")
+            # constant 60 degree ellipsoid incidence around the scene
+            points = np.array([[-96, 41, 60], [-94, 41, 60], [-96, 39, 60], [-94, 39, 60]], dtype=float)
+            asf.normalize_products(products, root, "scene", incidence_points=points)
             with rasterio.open(root / "Gamma0_VV.tif") as vv, rasterio.open(
                 root / "Gamma0_VH.tif"
             ) as vh, rasterio.open(root / "scene_DEM.tif") as dem, rasterio.open(
@@ -92,11 +96,16 @@ class DownloadTests(unittest.TestCase):
                     self.assertEqual(raster.crs.to_epsg(), 4326)
                 self.assertEqual(vv.dtypes, ("float32",))
                 self.assertTrue(np.isnan(vv.nodata))
-                np.testing.assert_allclose(vv.read(1)[:2, :3], 1)
+                np.testing.assert_allclose(vv.read(1)[:2, :3], 1)  # not normalized here
+                np.testing.assert_allclose(vh.read(1)[:2, :3], 1)
+                np.testing.assert_allclose(dem.read(1)[:2, :3], 1)
                 self.assertEqual(lia.dtypes, ("uint8",))
                 self.assertEqual(lia.nodata, 255)
-                np.testing.assert_array_equal(lia.read(1)[:2, :3], [[0, 1, 255]] * 2)
+                np.testing.assert_array_equal(lia.read(1)[:2, :3], [[0, 1, 255], [1, 1, 255]])
                 self.assertTrue(np.all(lia.read(1)[~np.isfinite(vv.read(1))] == 255))
+            with rasterio.open(root / "scene_incidenceAngleFromEllipsoid.tif") as inc:
+                self.assertEqual(inc.transform, vv.transform)
+                np.testing.assert_allclose(inc.read(1)[:2, :3], 60, rtol=1e-6)
 
     def fake_hyp3(self, outcomes, existing=()):
         """HyP3 mock: each granule's job runs one poll, then takes its outcome."""
