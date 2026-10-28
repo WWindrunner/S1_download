@@ -40,6 +40,8 @@ dependencies:
   - pip:
       # ASF catalogue/Earthdata downloads, including NISAR.
       - asf-search>=10.0.0
+      # Remote read of the GRD annotation (ellipsoid incidence for ASF RTC).
+      - remotezip
       # Sentinel-1 ASF HyP3 RTC adapter.
       - hyp3-sdk
       # snow_possible.py: ERA5 (Google ARCO zarr v3) for windows before 2021.
