@@ -103,7 +103,7 @@ class DownloadTests(unittest.TestCase):
                 self.assertEqual(lia.nodata, 255)
                 np.testing.assert_array_equal(lia.read(1)[:2, :3], [[0, 1, 255], [1, 1, 255]])
                 self.assertTrue(np.all(lia.read(1)[~np.isfinite(vv.read(1))] == 255))
-            with rasterio.open(root / "scene_incidenceAngleFromEllipsoid.tif") as inc:
+            with rasterio.open(root / "incidenceAngleFromEllipsoid.tif") as inc:
                 self.assertEqual(inc.transform, vv.transform)
                 np.testing.assert_allclose(inc.read(1)[:2, :3], 60, rtol=1e-6)
 

@@ -211,9 +211,9 @@ For each Sentinel-1 product name, the workflow runs the following steps:
    - Uses SNAP through pyroSAR to process VV and VH backscatter.
    - Produces the incidence-angle rasters required by the next step.
    - With `--download-source asf` (HyP3 RTC), HyP3 only provides the local
-     incidence angle. `<S1_NAME>_incidenceAngleFromEllipsoid.tif` is
-     interpolated from the geolocation grid of the GRD annotation, read
-     remotely from the ASF GRD zip (~1.6 MB, Earthdata `~/.netrc`, needs
+     incidence angle. `incidenceAngleFromEllipsoid.tif` (the default input
+     name of RAPID's `run_scenes.sh`) is interpolated from the geolocation
+     grid of the GRD annotation, read remotely from the ASF GRD zip (~1.6 MB, Earthdata `~/.netrc`, needs
      `remotezip`). `Gamma0_VV/VH.tif` are left as HyP3 RTC Gamma0; pass the
      angle to RAPID with `--inc_angle_path` to normalize. `<S1_NAME>_LIA.tif`
      also excludes HyP3 `_ls_map` shadow pixels (values with 8 or 16), so

@@ -156,7 +156,7 @@ def normalize_products(products, product_dir, granule, incidence_points=None):
                                    lia_threshold_degrees=50, download_source="asf",
                                    shadow="HyP3 ls_map values 8 or 16 also excluded")
     inc[~valid_vv] = np.nan
-    with rasterio.open(product_dir / f"{granule}_incidenceAngleFromEllipsoid.tif", "w", **profile) as target:
+    with rasterio.open(product_dir / "incidenceAngleFromEllipsoid.tif", "w", **profile) as target:
         target.write(inc, 1)
         target.set_band_description(1, "ellipsoid_incidence_angle_degrees")
         target.update_tags(download_source="asf", source="S1 annotation geolocationGrid")
@@ -169,7 +169,7 @@ RTC_OPTIONS = dict(radiometry="gamma0", scale="power", resolution=20,
 def output_names(granule):
     return ["Gamma0_VV.tif", "Gamma0_VH.tif", f"{granule}_DEM.tif",
             f"{granule}_localIncidenceAngle.tif", f"{granule}_LIA.tif",
-            f"{granule}_incidenceAngleFromEllipsoid.tif"]
+            "incidenceAngleFromEllipsoid.tif"]
 
 
 def outputs_complete(product_dir, granule):
