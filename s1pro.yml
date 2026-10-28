@@ -42,6 +42,10 @@ dependencies:
       - asf-search>=10.0.0
       # Sentinel-1 ASF HyP3 RTC adapter.
       - hyp3-sdk
+      # snow_possible.py: ERA5 (Google ARCO zarr v3) for windows before 2021.
+      - xarray>=2026.9.0
+      - zarr>=3.1.5
+      - gcsfs>=2026.10.1
 
 # ESA SNAP (including the `gpt` executable) is an external application used by
 # pyroSAR. Install SNAP separately and ensure its bin directory is on PATH.
