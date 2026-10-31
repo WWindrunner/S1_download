@@ -259,18 +259,25 @@ Standalone scripts (not yet in `execute.sh`) that make the inputs of RAPID's
 
 | Script | Output |
 |---|---|
-| `snow_possible.py` | `<S1>_snow_possible.tif`: 1 where snow is physically possible. 30-day minimum 2 m temperature (NOAA GFS 0.25° TMIN from AWS, a few hours latency; ERA5 for windows before 2021) moved to sea level and back to Copernicus DEM GLO-90 height with 6.5 K/km, ≤ 5 °C. Prints `SNOW_POSSIBLE` / `SNOW_IMPOSSIBLE`; with `SNOW_IMPOSSIBLE` the S2 snow mask is not needed. |
+| `snow_possible.py` | `<S1>_snow_possible.tif`: 1 where snow or ice is physically possible at the S1 time: 2 m temperature moved to sea level and back to Copernicus DEM GLO-90 height with 6.5 K/km ≤ 0 °C, or model snow depth > 0, or model ice > 0 (lake ice grown by one 0.25° cell for small lakes). Model at the hour nearest the S1 time: ERA5 (snow depth, lake ice depth where lake cover > 5%, sea ice) when it is out, else NOAA GFS 0.25° from AWS (SNOD, ICETK; a few hours latency). Lakes stay frozen with the air well above 0 °C (Red River 2022-05-01: 2.5–5 °C over frozen Lake of the Woods and Upper / Lower Red Lake), so the temperature alone is not enough. Prints `PRODUCT realtime <date>` (GFS) or `PRODUCT research` (ERA5), then `SNOW_POSSIBLE` / `SNOW_IMPOSSIBLE`; with `SNOW_IMPOSSIBLE` the S2 snow mask is not needed. |
 | `snow_latest_clear.py` | `<S1>_ice.tif`: snow from the latest clear Sentinel-2 SCL view in the 15-day window: 0 not snow, 1–15 snow and its age in days (1 = S1 day), 200 cloud / shadow only, 255 no data. Replaces "snow on any day" of `Snow_detect.py`, which removes flood where snow melted before the S1 date. |
 | `find_bursts.py` | `bursts.json`: SLC bursts of the GRD scene and their two previous acquisitions. |
 | `hyp3_coh.py` | `submit` / `fetch` ASF HyP3 `INSAR_ISCE_BURST` jobs (looks 5x1, 1 credit per pair) for event (pre1, co) and baseline (pre2, pre1) pairs. |
 | `coh_loss.py` | `<S1>_coh.tif` on the RAPID grid: band 1 baseline, 2 event, 3 loss = baseline − event. |
+
+Real-time and research product: within about a week of the S1 time
+`snow_possible.py` uses GFS (`PRODUCT realtime <date>`). Run it again from that date on
+and it replaces the GFS fields with ERA5 (`PRODUCT research`); then rerun
+`snow_latest_clear.py` (if it was skipped and the scene is now `SNOW_POSSIBLE`) and
+RAPID's `Post_masks/apply_masks.py`. RAPID itself is not rerun. On the Red River scene
+ERA5 has ice on many small frozen lakes east of the valley that GFS misses.
 
 Coherence is only needed when the desert mask (desert raster ∩ WorldCover 60)
 overlaps RAPID flood classes 2–5.
 
 ```bash
 S=<S1_NAME>; REF=<RAPID output>/$S/Morph/Morph_final.tif
-python snow_possible.py $S $REF ${S}_snow_possible.tif | tail -1
+python snow_possible.py $S $REF ${S}_snow_possible.tif | tail -2
 python snow_latest_clear.py $S $REF ${S}_ice.tif          # only if SNOW_POSSIBLE
 python find_bursts.py $S bursts.json                       # only if desert ∩ flood
 python hyp3_coh.py submit bursts.json coh_$S               # later: fetch
