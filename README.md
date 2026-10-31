@@ -253,9 +253,15 @@ all four stages succeed. Failed-stage files remain available for inspection.
 
 Standalone scripts (not yet in `execute.sh`) that make the inputs of RAPID's
 `Post_masks/apply_masks.py`, which relabels a finished RAPID result
-(`Morph_final.tif`). They run on the RAPID grid. Validated on
-`S1A_IW_GRDH_1SDV_20220501T001528_..._05229E_121A` (Red River, snow) and
-`S1A_IW_GRDH_1SDV_20251227T200851_..._07D522_C3E7` (Gulf of Carpentaria, beach).
+(`Morph_final.tif`). They run on the RAPID grid.
+
+Testing status: the snow / ice and desert masks in their current form are tested on
+two scenes only, checked against Planet imagery:
+`S1A_IW_GRDH_1SDV_20220501T001528_20220501T001603_043010_05229E_121A` (Red River,
+frozen lakes next to a valid flood) and
+`S1A_IW_GRDH_1SDV_20260107T141552_20260107T141617_062662_07DB2A_B7B0` (California,
+desert mask; no snow or ice on water). More snow cases need to be tested before
+operational use.
 
 | Script | Output |
 |---|---|
