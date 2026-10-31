@@ -11,7 +11,9 @@ when it has that hour: 2 m temperature, snow depth, lake ice depth where the lak
 is > 5%, and sea ice cover. Otherwise (recent scenes, ERA5 lags by days) and from
 2021-01-01 on, NOAA GFS 0.25 deg hourly output of the cycle before the acquisition,
 forecast hour = acquisition time rounded to the hour (AWS archive, a few hours behind
-real time): 2 m temperature (TMP), snow depth (SNOD) and ice thickness (ICETK).
+real time): 2 m temperature (TMP), snow depth (SNOD) and ice thickness (ICETK). Snow counts from 1 cm depth (ERA5
+water equivalent / snow density): ERA5 has 1-1.5 mm of snow on the flooded Red River
+valley of the scene below, which would otherwise make it snow-possible.
 ERA5 is preferred because its lake model has ice on more lakes: on the Red River scene
 below GFS has no ice on many small lakes east of the valley that are frozen.
 
@@ -73,6 +75,7 @@ name, ref_path, out_path = argv[1:4]
 t_c = float(argv[4]) if len(argv) > 4 else 0.0
 model_cache = os.path.splitext(out_path)[0] + "_model.npz"
 LAKE_COVER = 0.05  # ERA5 lake ice depth is also set on cells with almost no lake
+SNOW_MIN = 0.01  # m; ERA5 leaves traces (~1 mm) on the flooded Red River valley
 started = time.perf_counter()
 
 with rasterio.open(ref_path) as ref:
@@ -87,7 +90,7 @@ hour = (when + timedelta(minutes=30)).replace(minute=0, second=0)  # nearest ful
 
 
 def fetch_era5():
-    """Sea-level 2 m temperature, snow depth (m water) and ice (m or cover) from ERA5 at
+    """Sea-level 2 m temperature, snow depth (m) and ice (m or cover) from ERA5 at
     the hour nearest the S1 time, and their grid."""
     ds = xr.open_zarr(ERA5, chunks=None, storage_options=dict(token="anon"))
     # the time axis runs to 2050; ERA5T (preliminary, ~6 days behind) ends at this date
@@ -110,7 +113,8 @@ def fetch_era5():
           f"{t2m.sizes['latitude']}x{t2m.sizes['longitude']} cells")
     # static field stored on the time axis: one hour is enough
     oro = get("geopotential_at_surface").values / G
-    snow = np.nan_to_num(get("snow_depth").values)
+    swe = np.nan_to_num(get("snow_depth").values)  # m of water equivalent
+    snow = np.where(swe > 0, swe * 1000 / get("snow_density").values, 0)
     lake_ice = np.where(get("lake_cover").values > LAKE_COVER,
                         np.nan_to_num(get("lake_ice_depth").values), 0)
     ice = np.maximum(lake_ice, np.nan_to_num(get("sea_ice_cover").values))
@@ -203,8 +207,8 @@ if fetch_only:
 cache = np.load(model_cache)
 t0, snow, ice, lats, lons = (cache[k] for k in ("t0", "snow", "ice", "lats", "lons"))
 print(f"model fields over the box ({cache['sources']}, {cache['hour']}): 2 m temperature at "
-      f"sea level {np.nanmin(t0):.1f} .. {np.nanmax(t0):.1f} C; cells with snow "
-      f"{(snow > 0).sum()}, with ice {(ice > 0).sum()} of {snow.size}")
+      f"sea level {np.nanmin(t0):.1f} .. {np.nanmax(t0):.1f} C; cells with snow >= "
+      f"{SNOW_MIN} m {(snow >= SNOW_MIN).sum()}, with ice {(ice > 0).sum()} of {snow.size}")
 
 
 def to_grid(arr, resample="bilinear"):
@@ -235,7 +239,7 @@ dem = np.where(np.isfinite(dem), dem, 0)
 
 t_dem = to_grid(t0) - LAPSE * dem
 cold = t_dem <= t_c
-frozen_cells = (snow > 0) | maximum_filter(ice > 0, size=3)
+frozen_cells = (snow >= SNOW_MIN) | maximum_filter(ice > 0, size=3)
 frozen = to_grid(frozen_cells, "near") > 0
 possible = cold | frozen
 out = np.where(ref_invalid, 255, possible).astype(np.uint8)
