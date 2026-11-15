@@ -11,8 +11,8 @@ Sensor/product and download provider are independent parameters:
 
 | Sensor | Product type | Download source | Processing |
 | --- | --- | --- | --- |
-| `s1` (default) | `GRD` (default for s1) | `asf` (default) | Submit Sentinel-1 HyP3 RTC jobs (all scenes concurrently) |
-| `s1` | `GRD` | `cdse` | CDSE download + SNAP |
+| `s1` (default) | `GRD` (default for s1) | `cdse` (default for s1) | CDSE download + SNAP (Copernicus 30 m DEM, terrain flattening) |
+| `s1` | `GRD` | `asf` | Submit Sentinel-1 HyP3 RTC jobs (all scenes concurrently) |
 | `nisar` | `GCOV` (default for nisar) | `asf` (default for nisar) | Download existing HDF5, export backscatter and calculate masks |
 
 Unsupported combinations are rejected before searching/downloading.
@@ -208,7 +208,10 @@ For each Sentinel-1 product name, the workflow runs the following steps:
 1. `Sentinel_1_specific_name_download_process.py`
    - Searches for and downloads the Sentinel-1 GRD product from Copernicus
      Data Space.
-   - Uses SNAP through pyroSAR to process VV and VH backscatter.
+   - Uses SNAP through pyroSAR to process VV and VH backscatter: thermal-noise
+     removal, terrain flattening and terrain correction with the Copernicus 30 m
+     global DEM, gamma0 at 20 m on EPSG:4326. This is the default
+     (`--download-source cdse`).
    - Produces the incidence-angle rasters required by the next step.
    - With `--download-source asf` (HyP3 RTC), HyP3 only provides the local
      incidence angle. `incidenceAngleFromEllipsoid.tif` (the default input
@@ -216,8 +219,9 @@ For each Sentinel-1 product name, the workflow runs the following steps:
      grid of the GRD annotation, read remotely from the ASF GRD zip
      (~1.6 MB, Earthdata `~/.netrc`, needs `remotezip`), together with
      `<S1_NAME>_manifest.safe` for the orbit direction.
-   - `Gamma0_VV/VH.tif` are left as HyP3 RTC Gamma0; pass the angle to RAPID
-     with `--inc_angle_path` to normalize.
+   - `Gamma0_VV/VH.tif` are HyP3 RTC Gamma0 divided by cos(ellipsoid
+     incidence), the same normalization as the SNAP path (see
+     [Normalization for RAPID](#normalization-for-rapid)).
    - `<S1_NAME>_LIA.tif` is made by `cal_LIA.py` from this angle and the HyP3
      `<S1_NAME>_DEM.tif`, as for SNAP (HyP3's own local incidence angle is kept
      as `<S1_NAME>_localIncidenceAngle.tif` but not used for the mask).
@@ -587,10 +591,15 @@ for checkpoints; the legacy flood-warning runner removes them after success.
 
 ## Download channel
 
-Sentinel-1 commands use ASF HyP3 RTC by default. Use `--download-source cdse`
-(or `DOWNLOAD_SOURCE=cdse` in the shell scripts) for Copernicus Data Space + SNAP.
-Catalogue searching remains on CDSE and does not require authentication. ASF
-authentication uses Earthdata `~/.netrc`, independently of the CDSE credentials.
+Sentinel-1 commands use Copernicus Data Space + SNAP by default (Copernicus 30 m
+DEM with terrain flattening; export `CDSE_USERNAME` and `CDSE_PASSWORD`). ASF
+HyP3 RTC is optional: use `--download-source asf` (or `DOWNLOAD_SOURCE=asf` in
+the shell scripts). The default was switched back from ASF to SNAP because ASF
+inputs caused issues downstream in RAPID (for example, normalized ASF Gamma0
+changes the windy-scene statistics, so the vegetation veto misfires on some
+scenes). NISAR still uses ASF. Catalogue searching remains on CDSE and does not
+require authentication. ASF authentication uses Earthdata `~/.netrc`,
+independently of the CDSE credentials.
 
 With ASF, `SAR_download_process.py` and the daily workflow first submit RTC jobs
 for all selected scenes, so ASF processes them concurrently. Each job is
@@ -598,21 +607,67 @@ downloaded and converted as soon as it succeeds (up to 4 at a time), while the
 others are still processing. Masks are then generated scene by scene. A failed
 submission, HyP3 job, download or conversion only marks that scene as failed;
 the other scenes continue. Reruns skip scenes whose ASF outputs already exist
-and reuse a pending or unexpired HyP3 job with identical options instead of
+(and are normalized) and reuse a pending or unexpired HyP3 job with identical options instead of
 resubmitting, so an interrupted run does not spend credits twice.
 
 ```bash
-# CDSE + SNAP with positional credentials:
-python Sentinel_1_specific_name_download_process.py "$SCENE" ./data "$CDSE_USERNAME" "$CDSE_PASSWORD" --download-source cdse
-# ASF (default) does not require CDSE credentials:
-python Sentinel_1_specific_name_download_process.py "$SCENE" ./data
+# CDSE + SNAP (default) with positional credentials:
+python Sentinel_1_specific_name_download_process.py "$SCENE" ./data "$CDSE_USERNAME" "$CDSE_PASSWORD"
+# ASF does not require CDSE credentials:
+python Sentinel_1_specific_name_download_process.py "$SCENE" ./data --download-source asf
 # Direct ASF adapter (also accepts comma-separated scene names):
 python Sentinel_1_specific_name_ASF.py "$SCENE" ./data
-# Daily warning workflow:
-python Sentinel_1_ESA_search_download_process_chain_v4.py --desert-mask-vrt /path/desert.vrt --download-source asf
-# Shell/Slurm entry points (default DOWNLOAD_SOURCE=asf):
-DOWNLOAD_SOURCE=cdse bash execute.sh
-sbatch --export=ALL,DOWNLOAD_SOURCE=cdse execute_flood_warning.sh
+# Daily warning workflow (CDSE + SNAP by default):
+python Sentinel_1_ESA_search_download_process_chain_v4.py --desert-mask-vrt /path/desert.vrt
+# Shell/Slurm entry points (default DOWNLOAD_SOURCE=cdse for Sentinel-1):
+bash execute.sh
+sbatch --export=ALL,DOWNLOAD_SOURCE=asf execute_flood_warning.sh
+```
+
+### Parallel Sentinel-1 processing
+
+`--workers N` processes N Sentinel-1 scenes at once in separate processes (default 1).
+A failed scene does not stop the others. With CDSE + SNAP:
+
+- SNAP limits per scene: `--snap-threads` (gpt `-q`; default with `--workers > 1`:
+  available CPUs / N) and `--snap-heap` (Java `-Xmx`; default with `--workers > 1`:
+  24G). They are passed to SNAP as `SNAP_THREADS` / `SNAP_HEAP`. Without them a single
+  SNAP run uses the install setting `-Xmx528G` and grew to 64 GB.
+- CDSE downloads are limited to 4 at a time across all of the user's processes on the
+  machine (CDSE quota: 4 concurrent connections per user, 20 MB/s each), via lock files
+  in `~/.cache/s1_download/cdse_slots` (`CDSE_LOCK_DIR`, `CDSE_MAX_DOWNLOADS`). The
+  login happens inside the slot, because a CDSE token expires after 10 minutes.
+  Downloads are written to `<name>.zip.part` and renamed when complete.
+- CDSE also caps downloads at 12 TB per rolling 30 days per user; above that the account
+  drops to 1 connection at 1 MB/s.
+
+Measured SNAP step (2026-11-04, execute-4007, one IW GRD scene, 1.7 GB zip):
+
+| Setting | Wall time per scene | Peak memory per scene | CPU | Throughput |
+|---|---|---|---|---|
+| 1 scene, install defaults | 343 s | 64 GB | ~25 cores | 343 s / scene |
+| 8 scenes, 24G heap, 6 threads each | 900-960 s | 11-14 GB (87 GB total) | ~4 cores each | 120 s / scene |
+
+Parallel runs are limited by disk I/O rather than CPU, so about 4 threads per scene are
+enough. Recommended number of scenes in parallel:
+
+| Use | Workers | Resources |
+|---|---|---|
+| Batches (validation sets, one archive month) | 8 (tested) | about 32 CPUs, 128 GB |
+| Multi-week archive runs | about 3-4 (estimate, not measured) | about 16 CPUs, 64 GB |
+| One or two scenes | 1, with `--snap-heap 32G` | all cores |
+
+More than 8 per job is untested; disk contention grows with each extra SNAP run. For
+long runs the CDSE limit of 12 TB per 30 days (about 7,000 scenes, about 235 per day)
+is the bottleneck: 8 workers process about 640 scenes per day and would use the quota
+in about 10 days, after which downloads drop to 1 MB/s.
+
+For 8 scenes request about 32 CPUs and 128 GB:
+
+```bash
+sbatch --cpus-per-task=32 --mem=128G --export=ALL,WORKERS=8 execute.sh
+python SAR_download_process.py --names $SCENES --output-dir ./data \
+    --desert-mask-vrt /path/desert.vrt --workers 8
 ```
 
 Install the optional ASF dependency into the processing environment with
@@ -636,15 +691,72 @@ ASF requests 20 m linear gamma0 RTC and reprojects layers onto a shared WGS84
 (EPSG:4326) grid at 20/111320 degrees. Gamma0 and DEM are float32 with NaN nodata.
 The DEM is retained as `<SCENE>_DEM.tif`. The ancillary mask workflow uses this
 grid. Exact grid extents and pixel values are not guaranteed to match SNAP:
-HyP3 and SNAP use different processing algorithms, and the existing SNAP path
-also applies its original ellipsoid-angle normalization, which is preserved.
-ASF gamma0 is used directly without an additional cosine correction.
+HyP3 and SNAP use different processing algorithms.
 
 The [HyP3 product guide](https://hyp3-docs.asf.alaska.edu/guides/rtc_product_guide/)
 defines `_inc_map.tif` as **local incidence angle in radians**. The adapter converts
-it to degrees and writes the LIA mask directly: 0 for <=50 degrees, 1 for >50,
-255 for nodata. It must not be passed to `cal_LIA.py` as an ellipsoid angle.
-The ASF branch therefore skips that calculation; desert, snow and cloud stages
-still run. The legacy flood-warning cleanup removes the intermediate local-angle
-raster, while retaining the DEM; the unified runner retains both. The standalone ASF adapter produces the SAR,
-DEM, angle and LIA products; the full chain adds the other masks.
+it to degrees as `<SCENE>_localIncidenceAngle.tif`, kept for inspection only; it
+must not be passed to `cal_LIA.py` as an ellipsoid angle. The ellipsoid angle
+`incidenceAngleFromEllipsoid.tif` comes from the GRD annotation instead, and
+`cal_LIA.py` makes `<SCENE>_LIA.tif` from it and the HyP3 DEM, as for SNAP.
+The standalone ASF adapter produces the SAR, DEM, angle and layover-shadow
+products; the full chain adds the LIA, desert, snow and cloud masks.
+
+### Normalization for RAPID
+
+Both channels deliver Gamma0 that is ready for RAPID:
+
+```
+Gamma0_VV/VH.tif = Gamma0_RTC / cos(theta_ellipsoid)
+```
+
+SNAP does this in `incidence_process`; ASF does it in `normalize_products`
+(`Sentinel_1_specific_name_ASF.py`) and tags both rasters with
+`normalization=gamma0 / cos(ellipsoid incidence)`. Pass these files to RAPID
+**without** `--inc_angle_path`; RAPID would otherwise divide by cos(theta) a
+second time. The angle raster is still written for `cal_LIA.py`. ASF scene folders whose `Gamma0_VV.tif`
+lacks the tag (raw Gamma0 from earlier versions) are reprocessed on the next run.
+
+## Historical archive search (2016-2025, cached by year/month)
+
+`S1_archive_search.py` lists Sentinel-1 IW GRDH scenes over past GloFAS flood
+warnings, one UTC day at a time, into a resumable cache. Its warning source is:
+
+| Days | GloFAS layer | Default selection |
+| --- | --- | --- |
+| from 2019-11-02 | `RapidFloodMapping` warning areas | region > 5000 km2 (after expansion) and >= 50 km2 of the region's original warning pixels inside the scene |
+| 2015-12-17 to 2019-11-01 | `ReportingPoints` alert points | 20-year alert (`ThresGroup` 3), probability >= 50%, scene footprint within 10 km of the point |
+
+`RapidFloodMapping` does not exist before 2019-11-02; a later day without that file
+falls back to `ReportingPoints`. In a 2019-11 to 2021 comparison, about 75% of
+scenes selected by the point rule were also selected by the warning-area rule.
+
+```text
+output_search/
+  cache/YYYY/MM/YYYY-MM-DD.json        # every candidate with its metrics (see below)
+  cache/YYYY/MM/YYYY-MM-DD_rfm.zip     # or _points.zip: the downloaded GloFAS layer
+  results/YYYY.json                    # sorted unique dual-pol S1 names (1SDV/1SDH), nothing else
+```
+
+The cache stores candidates above loose floors (regions > 1000 km2 with any
+overlap; points with `ThresGroup` >= 2 within 25 km), so the selection can be
+changed later without searching again. Extracted shapefiles and rasters are
+temporary; each zip can rebuild its day. A day is cached only after it fully
+succeeds, so rerunning resumes; `--refresh` searches cached days again.
+
+```bash
+# Search a period into the cache (rerun to resume; days are inclusive).
+python S1_archive_search.py search --start 2016-01-01 --end 2016-01-31 --root output_search
+# Write results/YYYY.json; change the selection without searching again.
+python S1_archive_search.py merge --root output_search --years 2016 2025
+python S1_archive_search.py merge --root output_search --years 2016 2025 \
+    --min-region-km2 10000 --min-overlap-km2 200
+python S1_archive_search.py merge --help
+```
+
+Long periods can be split into separate `search` runs (for example one per
+month) sharing the same `--root`. The merge refuses to write a year with
+uncached (failed) days and lists them; search again to fill them, or add
+`--allow-incomplete`. GloFAS (HTTP 504) and the CDSE catalogue (HTTP 429)
+reject requests at about 32 parallel clients; 6 succeeded, and requests retry
+up to 8 times with growing waits.
