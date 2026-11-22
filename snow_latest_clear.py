@@ -12,6 +12,9 @@ Output values on the reference grid:
            (1 = same day, 2 = one day earlier, ...). Smaller = more trustable
     200    observed only as cloud / cloud shadow / cirrus: snow undetermined
     255    no data: no S2 observation in the window, or reference is nodata
+Band 2: age of that latest clear observation, 1..15 (same counting), for snow and
+no-snow alike; 0 where there is none (200 / 255 in band 1). A no-snow view 6-15 days
+old gives 116 plausible snow in apply_masks: snow may have fallen after it.
 """
 import re
 import sys
@@ -64,6 +67,7 @@ print(f"{sum(map(len, by_date.values()))} S2 SCL assets over {len(by_date)} date
       f"{start:%Y-%m-%d} .. {day:%Y-%m-%d}")
 
 mask = np.full((rows, cols), NODATA, np.uint8)
+age = np.zeros((rows, cols), np.uint8)
 seen_cloud = np.zeros((rows, cols), bool)
 print("date        value  newly-decided%  snow-of-new%  undecided%")
 for date in sorted(by_date, reverse=True):
@@ -78,6 +82,7 @@ for date in sorted(by_date, reverse=True):
     new = undecided & ~np.isin(scl, NOT_CLEAR)
     seen_cloud |= undecided & np.isin(scl, CLOUD_CLASSES)
     mask[new] = np.where(scl[new] == SNOW, value, NO_SNOW)
+    age[new] = value
     n_new = new.sum()
     print(f"{date}  {value:5d}  {100 * n_new / mask.size:14.2f}  "
           f"{100 * (mask[new] == value).sum() / max(1, n_new):12.2f}  "
@@ -86,15 +91,19 @@ for date in sorted(by_date, reverse=True):
 
 mask[(mask == NODATA) & seen_cloud] = CLOUD
 mask[ref_invalid] = NODATA
+age[ref_invalid] = 0
 
-profile.update(driver="GTiff", count=1, dtype="uint8", nodata=NODATA,
+profile.update(driver="GTiff", count=2, dtype="uint8", nodata=NODATA,
                compress="deflate", tiled=True, blockxsize=256, blockysize=256,
                BIGTIFF="IF_SAFER")
 with rasterio.open(out_path, "w", **profile) as dst:
     dst.write(mask, 1)
+    dst.write(age, 2)
     dst.set_band_description(
         1, "0 no snow; 1-15 snow, day of latest clear S2 obs counted back from "
            "S1 day (1 = same day); 200 cloud only; 255 nodata")
+    dst.set_band_description(
+        2, "age of the latest clear S2 obs, snow or not (1 = S1 day); 0 none")
 
 valid = ~ref_invalid
 counts = {v: int(((mask == v) & valid).sum()) for v in np.unique(mask[valid])}
