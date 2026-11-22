@@ -723,10 +723,14 @@ def incidence_process(VV_VH_incidence_path):
             a=1
 
 
-def run_new_processing_chain(product_name, output_dir, desert_mask_vrt, download_source="asf", sensor="s1"):
-    """Run the maintained per-product workflow and its ancillary masks."""
+def run_new_processing_chain(product_name, output_dir, desert_mask_vrt, download_source=None, sensor="s1"):
+    """Run the maintained per-product workflow and its ancillary masks.
+
+    download_source defaults to cdse (SNAP) for Sentinel-1 and asf for NISAR.
+    """
     if sensor not in ("s1", "nisar"):
         raise ValueError(f"Unknown sensor: {sensor}")
+    download_source = download_source or ("asf" if sensor == "nisar" else "cdse")
     if download_source not in ("cdse", "asf"):
         raise ValueError(f"Unknown download source: {download_source}")
     if sensor == "nisar":
@@ -746,9 +750,9 @@ def run_new_processing_chain(product_name, output_dir, desert_mask_vrt, download
         (
             "Sentinel-1 download and preprocessing",
             "Sentinel_1_specific_name_download_process.py",
-            [s1name, output_dir,
-             *([username, password] if download_source == "cdse" else []),
-             "--download-source", download_source],
+            # CDSE credentials are read from the environment by the child (kept off the
+            # command line, which error messages print).
+            [s1name, output_dir, "--download-source", download_source],
         ),
         (
             "desert mask",
@@ -855,9 +859,11 @@ def main():
     parser.add_argument("--window-size", type=int, default=10)
     parser.add_argument("--area-thresholds", type=float, default=1000)
     parser.add_argument("--sensor", choices=("s1", "nisar"), default="s1")
-    parser.add_argument("--download-source", choices=("cdse", "asf"), default="asf",
-                        help="Sentinel-1: asf (HyP3 RTC, default) or cdse (SNAP); NISAR: asf.")
+    parser.add_argument("--download-source", choices=("cdse", "asf"),
+                        help="Sentinel-1: cdse (CDSE + SNAP, Copernicus 30 m DEM; default) or asf "
+                             "(HyP3 RTC); NISAR: asf (default).")
     args = parser.parse_args()
+    args.download_source = args.download_source or ("asf" if args.sensor == "nisar" else "cdse")
     if args.sensor == "nisar" and args.download_source != "asf":
         parser.error("NISAR GCOV requires --download-source asf")
     if args.search_only:

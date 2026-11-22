@@ -43,8 +43,7 @@ class DownloadTests(unittest.TestCase):
 
     def test_asf_cli_does_not_require_cdse_credentials(self):
         with patch.object(asf, "download_and_process", return_value={}) as process:
-            # ASF is the default source.
-            self.assertEqual(downloader.main(["one.SAFE,two", "data"]), 0)
+            self.assertEqual(downloader.main(["one.SAFE,two", "data", "--download-source", "asf"]), 0)
             process.assert_called_once_with(["one", "two"], os.path.abspath("data"))
             process.return_value = {"two": "failed"}
             self.assertEqual(downloader.main(["one,two", "data", "--download-source", "asf"]), 1)
@@ -98,8 +97,10 @@ class DownloadTests(unittest.TestCase):
                     self.assertEqual(raster.crs.to_epsg(), 4326)
                 self.assertEqual(vv.dtypes, ("float32",))
                 self.assertTrue(np.isnan(vv.nodata))
-                np.testing.assert_allclose(vv.read(1)[:2, :3], 1)  # not normalized here
-                np.testing.assert_allclose(vh.read(1)[:2, :3], 1)
+                # normalized here: 1 / cos(60 deg) = 2, as in the SNAP chain
+                np.testing.assert_allclose(vv.read(1)[:2, :3], 2, rtol=1e-5)
+                np.testing.assert_allclose(vh.read(1)[:2, :3], 2, rtol=1e-5)
+                self.assertEqual(vv.tags()["normalization"], asf.NORMALIZATION)
                 np.testing.assert_allclose(dem.read(1)[:2, :3], 1)
                 # HyP3 radians -> degrees; the LIA mask itself comes from cal_LIA.py
                 np.testing.assert_allclose(local.read(1)[:2, :2], [[40, 60]] * 2, rtol=1e-5)
@@ -110,6 +111,10 @@ class DownloadTests(unittest.TestCase):
                 np.testing.assert_array_equal(ls.read(1)[:2, :3], [[1, 1, 1], [25, 1, 0]])
             self.assertFalse((root / "scene_LIA.tif").exists())
             self.assertEqual((root / "scene_manifest.safe").read_bytes(), b"<pass>ASCENDING</pass>")
+            self.assertTrue(asf.outputs_complete(root, "scene"))
+            with rasterio.open(root / "Gamma0_VV.tif", "r+") as vv:
+                vv.update_tags(normalization="")  # raw Gamma0 from before: redo
+            self.assertFalse(asf.outputs_complete(root, "scene"))
 
     def fake_hyp3(self, outcomes, existing=()):
         """HyP3 mock: each granule's job runs one poll, then takes its outcome."""
@@ -175,6 +180,10 @@ class DownloadTests(unittest.TestCase):
             (Path(folder) / "done").mkdir()
             for name in asf.output_names("done"):
                 (Path(folder) / "done" / name).write_bytes(b"x")
+            with rasterio.open(Path(folder) / "done" / "Gamma0_VV.tif", "w", driver="GTiff", width=1,
+                               height=1, count=1, dtype="float32") as vv:
+                vv.write(np.ones((1, 1, 1), dtype="float32"))
+                vv.update_tags(normalization=asf.NORMALIZATION)
             self.assertEqual(asf.download_and_process(["done", "running", "other"], folder), {})
         # Matching running job is reused; a job with different options is not.
         self.assertEqual(events, [("submit", "other")])
@@ -207,16 +216,56 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(list(failures), ["bad"])
         self.assertEqual([c.args[1] for c in convert.call_args_list], ["flaky"])
 
-    def test_drivers_default_sentinel_to_asf(self):
+    def test_parallel_driver_isolates_failures_and_sets_snap_limits(self):
+        import SAR_download_process as driver
+        with tempfile.TemporaryDirectory() as folder:
+            vrt = Path(folder) / "desert.vrt"
+            vrt.touch()
+            env = dict(CDSE_USERNAME="user", CDSE_PASSWORD="password")
+            with patch.dict(os.environ, env), patch.object(driver, "process_sentinel_parallel",
+                                                            wraps=driver.process_sentinel_parallel) as parallel, \
+                    patch("concurrent.futures.ProcessPoolExecutor",
+                          __import__("concurrent.futures").futures.ThreadPoolExecutor), \
+                    patch.object(driver, "process_sentinel",
+                                 side_effect=lambda name, args: (_ for _ in ()).throw(RuntimeError("x"))
+                                 if name == "bad" else None):
+                status = driver.main(["--names", "a", "bad", "c", "--output-dir", folder,
+                                      "--desert-mask-vrt", str(vrt), "--workers", "2",
+                                      "--snap-threads", "3", "--snap-heap", "16G"])
+                self.assertEqual((os.environ["SNAP_THREADS"], os.environ["SNAP_HEAP"]), ("3", "16G"))
+            parallel.assert_called_once()
+            self.assertEqual(status, 1)
+        parser = driver.build_parser()
+        with self.assertRaises(SystemExit):  # parallel options are Sentinel-1 only
+            driver.validate_args(parser, parser.parse_args(["--sensor", "nisar", "--names", "x",
+                                                            "--search-only", "--workers", "2"]))
+
+    def test_cdse_download_slots_are_limited(self):
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.dict(os.environ, dict(CDSE_LOCK_DIR=folder)), \
+                patch.object(downloader, "CDSE_MAX_DOWNLOADS", 1):
+            with downloader.cdse_download_slot():
+                import fcntl
+                with open(Path(folder) / "slot0", "w") as other:  # the only slot is taken
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with downloader.cdse_download_slot():  # released after use
+                pass
+
+    def test_drivers_default_sentinel_to_cdse_and_nisar_to_asf(self):
         import SAR_download_process as driver
         parser = driver.build_parser()
         args = parser.parse_args(["--names", "scene", "--search-only"])
         driver.validate_args(parser, args)
+        self.assertEqual(args.download_source, "cdse")
+        args = parser.parse_args(["--sensor", "nisar", "--names", "scene", "--search-only"])
+        driver.validate_args(parser, args)
         self.assertEqual(args.download_source, "asf")
         text = (ROOT / "Sentinel_1_ESA_search_download_process_chain_v4.py").read_text(encoding="utf-8")
-        self.assertIn('choices=("cdse", "asf"), default="asf"', text)
+        self.assertIn('args.download_source or ("asf" if args.sensor == "nisar" else "cdse")', text)
+        self.assertIn('default="cdse"', (ROOT / "Sentinel_1_specific_name_download_process.py").read_text(encoding="utf-8"))
         for script in ("execute.sh", "execute_flood_warning.sh"):
-            self.assertNotIn("DOWNLOAD_SOURCE:-cdse", (ROOT / script).read_text(encoding="utf-8"))
+            self.assertIn("DOWNLOAD_SOURCE:-cdse", (ROOT / script).read_text(encoding="utf-8"))
 
     def test_driver_asf_failure_does_not_stop_other_scenes(self):
         import SAR_download_process as driver
@@ -227,6 +276,7 @@ class DownloadTests(unittest.TestCase):
                        return_value={"bad": "ASF RTC job failed"}) as batch, \
                     patch.object(driver, "process_sentinel") as scene:
                 status = driver.main(["--names", "good", "bad", "good2", "--output-dir", folder,
+                                      "--download-source", "asf",
                                       "--desert-mask-vrt", str(vrt)])
             batch.assert_called_once()
             self.assertEqual(status, 1)

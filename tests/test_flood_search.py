@@ -407,7 +407,7 @@ class FloodSearchTests(unittest.TestCase):
         self.ns["run_new_processing_chain"] = Mock()
 
     def test_daily_main_default_and_nisar_routing_preserve_legacy_layout(self):
-        for sensor, source in (("s1", None), ("s1", "cdse"), ("nisar", None)):
+        for sensor, source in (("s1", None), ("s1", "asf"), ("nisar", None)):
             with self.subTest(sensor=sensor, source=source), tempfile.TemporaryDirectory() as directory, \
                     patch("Sentinel_1_specific_name_ASF.download_and_process", return_value={}) as asf_batch:
                 self.configure_daily_main()
@@ -419,9 +419,10 @@ class FloodSearchTests(unittest.TestCase):
                 vrt.touch()
                 env = dict(RAPID_PROJECT_DIR=directory)
                 argv = [str(SOURCE), "--desert-mask-vrt", str(vrt)]
-                if source == "cdse":
+                if sensor == "s1" and source != "asf":  # default CDSE needs credentials
                     env.update(CDSE_USERNAME="user", CDSE_PASSWORD="password")
-                    argv += ["--download-source", "cdse"]
+                if source:
+                    argv += ["--download-source", source]
                 elif sensor == "nisar":
                     argv += ["--sensor", "nisar"]
                 with patch.dict(os.environ, env, clear=True), patch.object(sys, "argv", argv):
@@ -437,9 +438,9 @@ class FloodSearchTests(unittest.TestCase):
                 self.assertEqual(manifest.read_text().strip(), str(output) + os.sep)
                 process = self.ns["run_new_processing_chain"]
                 if sensor == "s1":
-                    # Sentinel-1 defaults to ASF and submits the whole batch up front.
-                    process.assert_called_once_with(name, str(output), str(vrt), source or "asf")
-                    if source == "cdse":
+                    # Sentinel-1 defaults to CDSE + SNAP; ASF submits the whole batch up front.
+                    process.assert_called_once_with(name, str(output), str(vrt), source or "cdse")
+                    if source != "asf":
                         asf_batch.assert_not_called()
                     else:
                         asf_batch.assert_called_once_with(["scene"], str(output))

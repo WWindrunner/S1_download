@@ -1,4 +1,5 @@
 import argparse
+from contextlib import contextmanager
 import datetime
 import glob
 import os
@@ -41,6 +42,100 @@ def search_sentinel_with_S1name(S1name):
     return df
 
 
+# CDSE allows 4 concurrent download connections per user (documentation, Quotas).
+CDSE_MAX_DOWNLOADS = int(os.environ.get("CDSE_MAX_DOWNLOADS", "4"))
+
+
+@contextmanager
+def cdse_download_slot():
+    """Hold one of CDSE_MAX_DOWNLOADS lock files shared by all of this user's processes,
+    so parallel scenes and array tasks stay within the CDSE connection limit."""
+    import fcntl
+    import time
+
+    lock_dir = os.path.expanduser(os.environ.get("CDSE_LOCK_DIR", "~/.cache/s1_download/cdse_slots"))
+    os.makedirs(lock_dir, exist_ok=True)
+    while True:
+        for i in range(CDSE_MAX_DOWNLOADS):
+            handle = open(os.path.join(lock_dir, f"slot{i}"), "w")
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                handle.close()
+                continue
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+                handle.close()
+            return
+        time.sleep(10)
+
+
+@contextmanager
+def user_lock(name):
+    """Exclusive lock shared by all of this user's processes on the machine."""
+    import fcntl
+
+    lock_dir = os.path.expanduser(os.environ.get("CDSE_LOCK_DIR", "~/.cache/s1_download/cdse_slots"))
+    os.makedirs(lock_dir, exist_ok=True)
+    with open(os.path.join(lock_dir, f"{name}.lock"), "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def prime_snap_version_cache(ExamineSnap):
+    """Fill pyroSAR's SNAP module-version cache from <SNAP>/*/update_tracking/*.xml.
+
+    These are the installed-module records the launcher itself reports, so the
+    result matches `snap --modules --list` without starting SNAP. Returns False
+    (cache untouched) if the records or the microwave toolbox are not found.
+    """
+    import xml.etree.ElementTree as ET
+
+    if ExamineSnap._version_dict is not None:
+        return True
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.realpath(ExamineSnap().path)))
+    except Exception:
+        return False
+    versions = {}
+    for record in glob.glob(os.path.join(root, "*", "update_tracking", "*.xml")):
+        try:
+            module = ET.parse(record).getroot()
+            release = module.find("module_version")
+            versions[module.get("codename")] = {"version": release.get("specification_version"),
+                                                "state": "Installed"}
+        except Exception:
+            continue
+    # Clusters without update_tracking (e.g. snap/, which holds snap-core): the
+    # version is the module JAR's OpenIDE-Module-Specification-Version.
+    import zipfile
+    for config in glob.glob(os.path.join(root, "*", "config", "Modules", "*.xml")):
+        try:
+            module = ET.parse(config).getroot()
+            code = module.get("name")
+            jar = module.find("param[@name='jar']")
+            if code in versions or jar is None:
+                continue
+            cluster = os.path.dirname(os.path.dirname(os.path.dirname(config)))
+            with zipfile.ZipFile(os.path.join(cluster, jar.text)) as archive:
+                manifest = archive.read("META-INF/MANIFEST.MF").decode("utf-8", "replace")
+            for line in manifest.splitlines():
+                if line.startswith("OpenIDE-Module-Specification-Version:"):
+                    versions[code] = {"version": line.split(":", 1)[1].strip(), "state": "Installed"}
+                    break
+        except Exception:
+            continue
+    if "eu.esa.microwavetbx.microwavetbx.kit" not in versions:
+        return False
+    ExamineSnap._version_dict = versions
+    return True
+
+
 def download_Sentinel_with_ids_names(ids, name, output_dir, access_token):
     download_url = f"https://download.dataspace.copernicus.eu/odata/v1/Products({ids})/$value"
     download_headers = {
@@ -56,9 +151,12 @@ def download_Sentinel_with_ids_names(ids, name, output_dir, access_token):
             total_size = int(r.headers.get('content-length', 0))
             chunk_size = 8192
 
-            with open(output_path, 'wb') as f:
+            # Write to .part first: an interrupted download must not look complete.
+            partial_path = output_path + ".part"
+            with open(partial_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=chunk_size):
                     f.write(chunk)
+            os.replace(partial_path, output_path)
 
 
             print(" completed.")
@@ -66,11 +164,27 @@ def download_Sentinel_with_ids_names(ids, name, output_dir, access_token):
             raise RuntimeError(f"Sentinel-1 download failed with status {r.status_code}.")
 
 def process_snentinel_images(file, processed_path):
+    from pyroSAR.snap.auxil import ExamineSnap
     from pyroSAR.snap.util import geocode
+
+    # pyroSAR reads the SNAP version through the SNAP GUI launcher
+    # (snap --nogui --modules --list --refresh): one instance per user, a network
+    # refresh, and on compute nodes it can stall for hours. Fill pyroSAR's
+    # version cache from the installed-module records instead; fall back to the
+    # launcher only if those cannot be read.
+    if not prime_snap_version_cache(ExamineSnap):
+        with user_lock("snap_version"):
+            ExamineSnap().get_version("microwavetbx")
 
     target_resolution = 20
     terrain_flat_bool = True
     remove_therm_noise_bool = True
+
+    # Optional per-process SNAP limits, so several scenes can share a node:
+    # SNAP_THREADS -> gpt -q; SNAP_HEAP (e.g. 24G) -> Java -Xmx (the SNAP install sets 528G).
+    gpt_args = ["-q", os.environ["SNAP_THREADS"]] if os.environ.get("SNAP_THREADS") else None
+    if os.environ.get("SNAP_HEAP"):
+        os.environ["_JAVA_OPTIONS"] = f"-Xmx{os.environ['SNAP_HEAP']}"
 
     geocode(
         infile=file,
@@ -86,6 +200,7 @@ def process_snentinel_images(file, processed_path):
         export_extra=['incidenceAngleFromEllipsoid', 'localIncidenceAngle', 'DEM'],
         demName='Copernicus 30m Global DEM',
         nodataValueAtSea=False,
+        gpt_args=gpt_args,
     )
 
 
@@ -146,7 +261,8 @@ def main(argv=None):
     parser.add_argument("output_folder")
     parser.add_argument("username", nargs="?", default="")
     parser.add_argument("password", nargs="?", default="")
-    parser.add_argument("--download-source", choices=("cdse", "asf"), default="asf")
+    parser.add_argument("--download-source", choices=("cdse", "asf"), default="cdse",
+                        help="cdse (CDSE + SNAP, Copernicus 30 m DEM; default) or asf (HyP3 RTC)")
     args = parser.parse_args(argv)
     S1names = [name.strip().removesuffix(".SAFE") for name in args.names.split(",") if name.strip()]
     if not S1names:
@@ -155,7 +271,8 @@ def main(argv=None):
     if args.download_source == "asf":
         from Sentinel_1_specific_name_ASF import download_and_process
         return 1 if download_and_process(S1names, folder) else 0
-    username, password = args.username, args.password
+    username = args.username or os.environ.get("CDSE_USERNAME", "")
+    password = args.password or os.environ.get("CDSE_PASSWORD", "")
     if not username or not password:
         parser.error("Copernicus Data Space username and password are required")
     os.makedirs(folder, exist_ok=True)
@@ -180,8 +297,10 @@ def main(argv=None):
                     Sentinel_ori_dir = workfolder
                     Sentinel_1_GRD_file = os.path.join(workfolder, f'{name}.zip')
                     if not os.path.exists(Sentinel_1_GRD_file):
-                        access_token = log_in(username, password)
-                        download_Sentinel_with_ids_names(ids, name, Sentinel_ori_dir, access_token)
+                        # Log in inside the slot: a token expires after 10 min of waiting.
+                        with cdse_download_slot():
+                            access_token = log_in(username, password)
+                            download_Sentinel_with_ids_names(ids, name, Sentinel_ori_dir, access_token)
                     else:
                         # print("Product already downloaded.")
                         pass

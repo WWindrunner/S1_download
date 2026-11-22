@@ -2,6 +2,7 @@
 import argparse
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 
@@ -10,6 +11,7 @@ from sar_search import date_interval, search_polygon
 from sar_stages import SceneStages, implementation_stamp
 
 ROOT = Path(__file__).resolve().parent
+DEFAULT_PARALLEL_SNAP_HEAP = "24G"
 
 
 def process_sentinel(name, args):
@@ -17,13 +19,32 @@ def process_sentinel(name, args):
     stages = SceneStages(directory, args.force)
     source = args.download_source
 
-    def command(script, *values):
-        subprocess.run([sys.executable, str(ROOT / script), *map(str, values)], check=True)
+    def command(script, *values, timeout=None):
+        # Own process group, so a timeout also stops grandchildren (SNAP gpt / Java).
+        cmd = [sys.executable, str(ROOT / script), *map(str, values)]
+        proc = subprocess.Popen(cmd, start_new_session=True)
+        try:
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            for sig, grace in ((signal.SIGTERM, 60), (signal.SIGKILL, None)):
+                try:
+                    os.killpg(proc.pid, sig)
+                except ProcessLookupError:
+                    break
+                try:
+                    proc.wait(timeout=grace)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            raise TimeoutError(f"{script} exceeded {timeout} s and was stopped") from None
+        if returncode:
+            raise subprocess.CalledProcessError(returncode, cmd)
 
     def backscatter():
+        # CDSE credentials reach the child through the environment, never the command
+        # line, which error messages and logs would print.
         command("Sentinel_1_specific_name_download_process.py", name, args.output_dir,
-                os.environ.get("CDSE_USERNAME", ""), os.environ.get("CDSE_PASSWORD", ""),
-                "--download-source", source)
+                "--download-source", source, timeout=args.scene_timeout or None)
         paths = [directory / "Gamma0_VV.tif", directory / "Gamma0_VH.tif"]
         if source == "asf":
             paths += [directory / f"{name}_DEM.tif", directory / f"{name}_localIncidenceAngle.tif",
@@ -60,12 +81,52 @@ def process_sentinel(name, args):
     stages.finish()
 
 
+def _process_sentinel_worker(name, args):
+    """Run one scene in a worker; return errors as plain text, because some exceptions
+    (e.g. HTTPError holding an open response) cannot be sent back between processes."""
+    try:
+        process_sentinel(name, args)
+    except Exception as exc:
+        raise RuntimeError(f"{type(exc).__name__}: {exc}") from None
+
+
+def process_sentinel_parallel(names, args, asf_failures):
+    """Process Sentinel-1 scenes in args.workers processes; one failure affects only its scene."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    # SNAP limits reach the gpt child processes through the environment.
+    cpus = len(os.sched_getaffinity(0))
+    os.environ["SNAP_THREADS"] = str(args.snap_threads or max(1, cpus // args.workers))
+    os.environ["SNAP_HEAP"] = args.snap_heap or DEFAULT_PARALLEL_SNAP_HEAP
+    print(f"Parallel: {args.workers} scenes at a time, SNAP {os.environ['SNAP_THREADS']} threads / "
+          f"{os.environ['SNAP_HEAP']} heap each ({cpus} CPUs available)", flush=True)
+    failures = []
+    for name in names:
+        if name in asf_failures:
+            failures.append(name)
+            print(f"Failed {name}: {asf_failures[name]}; intermediates retained.", file=sys.stderr)
+    todo = [name for name in names if name not in asf_failures]
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(_process_sentinel_worker, name, args): name for name in todo}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                future.result()
+                print(f"Completed: {name}", flush=True)
+            except Exception as exc:
+                failures.append(name)
+                print(f"Failed {name}: {exc}; intermediates retained.", file=sys.stderr, flush=True)
+    print(f"Finished: {len(names) - len(failures)} succeeded, {len(failures)} failed")
+    return 1 if failures else 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sensor", choices=("s1", "nisar"), default="s1")
     parser.add_argument("--product-type", type=str.upper, help="Default: GRD for s1, GCOV for nisar; GUNW is unsupported")
-    parser.add_argument("--download-source", choices=("cdse", "asf"), default="asf",
-                        help="s1: asf (HyP3 RTC, default) or cdse (SNAP); nisar: asf")
+    parser.add_argument("--download-source", choices=("cdse", "asf"),
+                        help="s1: cdse (CDSE + SNAP, Copernicus 30 m DEM; default) or asf (HyP3 RTC); "
+                             "nisar: asf (default)")
     parser.add_argument("--output-dir", default="data")
     inputs = parser.add_mutually_exclusive_group()
     inputs.add_argument("--names", nargs="+", help="Exact product names (space- or comma-separated)")
@@ -91,11 +152,24 @@ def build_parser():
     parser.add_argument("--cache-dir", help="NISAR: shared DEM/geoid cache (default OUTPUT_DIR/.cache)")
     parser.add_argument("--lia-threshold", type=float, default=50.0)
     parser.add_argument("--force", action="store_true", help="Reprocess stages, retaining complete downloads")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="s1: scenes processed in parallel (separate processes). CDSE downloads stay "
+                             "limited to CDSE_MAX_DOWNLOADS (default 4) across all processes of the user.")
+    parser.add_argument("--snap-threads", type=int,
+                        help="s1 CDSE: SNAP gpt threads per scene. Default with --workers > 1: "
+                             "available CPUs / workers")
+    parser.add_argument("--scene-timeout", type=int, default=4 * 3600,
+                        help="s1: seconds allowed for one scene's download + backscatter processing "
+                             "before it is stopped and reported as failed (default 14400; 0 disables)")
+    parser.add_argument("--snap-heap",
+                        help="s1 CDSE: SNAP Java heap per scene, e.g. 24G. Default with --workers > 1: "
+                             f"{DEFAULT_PARALLEL_SNAP_HEAP}; otherwise the SNAP install setting")
     return parser
 
 
 def validate_args(parser, args):
     args.product_type = args.product_type or ("GCOV" if args.sensor == "nisar" else "GRD")
+    args.download_source = args.download_source or ("asf" if args.sensor == "nisar" else "cdse")
     supported = {("s1", "GRD", "cdse"), ("s1", "GRD", "asf"), ("nisar", "GCOV", "asf")}
     if (args.sensor, args.product_type, args.download_source) not in supported:
         parser.error("Supported combinations: s1/GRD/cdse, s1/GRD/asf, nisar/GCOV/asf. GUNW needs a separate interferometric workflow.")
@@ -103,6 +177,12 @@ def validate_args(parser, args):
                                    or args.geoid or args.polarizations or args.band != "LSAR" or args.frequency != "A"
                                    or args.dem_height_reference != "egm2008" or args.lia_threshold != 50):
         parser.error("H5, download-only, resolution, DEM, frequency, band, polarization and LIA options are NISAR-only")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    if args.scene_timeout < 0:
+        parser.error("--scene-timeout must be 0 (disabled) or a positive number of seconds")
+    if args.sensor != "s1" and (args.workers != 1 or args.snap_threads or args.snap_heap):
+        parser.error("--workers, --snap-threads and --snap-heap are Sentinel-1 options")
     if args.h5 and (args.search_only or args.download_only):
         parser.error("Local --h5 is for processing; it cannot be combined with search/download-only")
     spatial = args.extent_file or args.bbox or args.polygon_wkt
@@ -185,6 +265,12 @@ def main(argv=None):
             asf_failures = download_and_process(names, args.output_dir)
         except Exception as exc:
             asf_failures = {name: f"ASF batch failed: {exc}" for name in names}
+    if args.sensor == "s1" and args.workers > 1:
+        return process_sentinel_parallel(names, args, asf_failures)
+    if args.snap_threads:
+        os.environ["SNAP_THREADS"] = str(args.snap_threads)
+    if args.snap_heap:
+        os.environ["SNAP_HEAP"] = args.snap_heap
     for name in names:
         try:
             if name in asf_failures:

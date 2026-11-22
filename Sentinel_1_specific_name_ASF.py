@@ -4,8 +4,8 @@ Authentication uses Earthdata credentials in ~/.netrc. Importing this module
 never submits jobs. HyP3 local incidence angles are radians, not ellipsoid angles;
 the ellipsoid incidence angle is interpolated from the geolocation grid of the GRD
 annotation (the source of SNAP's incidenceAngleFromEllipsoid), read remotely from
-the ASF GRD zip. Gamma0 is left as HyP3 RTC; RAPID normalizes it with this angle
-(--inc_angle_path). The LIA exclusion mask is made by cal_LIA.py from this angle and
+the ASF GRD zip. Gamma0 is divided by cos(ellipsoid incidence) here, as in the SNAP
+chain, so RAPID takes it without --inc_angle_path. The LIA exclusion mask is made by cal_LIA.py from this angle and
 the HyP3 DEM, as in the SNAP chain. The HyP3 layover-shadow map is kept unchanged as
 <S1_NAME>_ls_map.tif (not used in any mask).
 """
@@ -104,8 +104,9 @@ def normalize_products(products, product_dir, granule, incidence_points=None, ma
     """Write float32 gamma0/DEM/angles and the uint8 HyP3 layover-shadow map on one
     WGS84 grid, plus the GRD manifest.
 
-    Gamma0 is not normalized here: the ellipsoid incidence angle is written for
-    RAPID's --inc_angle_path and for cal_LIA.py. The layover-shadow map keeps the
+    Gamma0 is normalized here by 1/cos(ellipsoid incidence), as in the SNAP chain,
+    so RAPID must not get --inc_angle_path; the angle is still written for cal_LIA.py.
+    The layover-shadow map keeps the
     HyP3 sums of 1 tested, 2 look < slope, 4 layover, 8 look < -slope, 16 shadow
     (0 = not tested / nodata).
     """
@@ -155,9 +156,14 @@ def normalize_products(products, product_dir, granule, incidence_points=None, ma
             raise ValueError(f"ASF raster has no valid pixels: {products[key]}")
         if key == "vv":
             valid_vv = np.isfinite(destination)
+        tags = dict(download_source="asf", processing="HyP3 RTC")
+        if key in ("vv", "vh"):
+            # Same normalization as the SNAP chain (incidence_process).
+            destination = (destination / np.cos(np.deg2rad(inc))).astype("float32")
+            tags["normalization"] = NORMALIZATION
         with rasterio.open(product_dir / filename, "w", **profile) as target:
             target.write(destination, 1)
-            target.update_tags(download_source="asf", processing="HyP3 RTC")
+            target.update_tags(**tags)
     inc[~valid_vv] = np.nan
     with rasterio.open(product_dir / "incidenceAngleFromEllipsoid.tif", "w", **profile) as target:
         target.write(inc, 1)
@@ -166,6 +172,8 @@ def normalize_products(products, product_dir, granule, incidence_points=None, ma
     if manifest is not None:
         (product_dir / f"{granule}_manifest.safe").write_bytes(manifest)
 
+
+NORMALIZATION = "gamma0 / cos(ellipsoid incidence)"
 
 RTC_OPTIONS = dict(radiometry="gamma0", scale="power", resolution=20,
                    include_inc_map=True, include_dem=True)
@@ -178,8 +186,14 @@ def output_names(granule):
 
 
 def outputs_complete(product_dir, granule):
-    return all((Path(product_dir) / name).is_file() and (Path(product_dir) / name).stat().st_size > 0
-               for name in output_names(granule))
+    import rasterio
+
+    if not all((Path(product_dir) / name).is_file() and (Path(product_dir) / name).stat().st_size > 0
+               for name in output_names(granule)):
+        return False
+    # Earlier ASF outputs left Gamma0 raw; redo them rather than pass them to RAPID.
+    with rasterio.open(Path(product_dir) / "Gamma0_VV.tif") as vv:
+        return vv.tags().get("normalization") == NORMALIZATION
 
 
 def retry_transient(action, label, attempts=4, wait=30):
