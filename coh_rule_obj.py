@@ -61,13 +61,13 @@ for T in THRS:
     blk = lambda a: a[:h*st, :w*st].reshape(h, st, w, st).sum((1, 3))
     vv = vds.ReadAsArray(buf_xsize=w, buf_ysize=h)
     g = np.clip((10 * np.log10(np.clip(vv, 1e-6, None)) + 22) / 20, 0, 1); g[~np.isfinite(g)] = 0; rgb = np.dstack([g, g, g]) * 0.6 + 0.2
-    mk250 = m == 250; mk100 = m == 100; mkoth = (m > 100) & (m < 200)   # mask labels: 250 black, 100 white, 101-199 (106-115) pink
-    for cnt, col in ((blk(m == 1), (0.15, 0.3, 1)), (blk(mk100), (1, 1, 1)), (blk(mkoth), (1, 0.2, 0.8)), (blk(mk250), (0, 0, 0)), (blk(nonp & ~rm), (0, 0.9, 1)), (blk(rm), (1, 0.15, 0.15))):
+    mk250 = m == 250; mk100 = m == 100; mkoth = (m > 100) & (m < 116); mk116 = m == 116   # mask labels: 250 black, 100 white, 106 pink, 116 orange
+    for cnt, col in ((blk(m == 1), (0.15, 0.3, 1)), (blk(mk100), (1, 1, 1)), (blk(mkoth), (1, 0.2, 0.8)), (blk(mk116), (1, 0.55, 0)), (blk(mk250), (0, 0, 0)), (blk(nonp & ~rm), (0, 0.9, 1)), (blk(rm), (1, 0.15, 0.15))):
         a = np.clip(cnt / (st * st) * 6, 0, 1)[..., None] * 0.95; rgb = rgb * (1 - a) + a * np.array(col)
     fig, ax = plt.subplots(figsize=(18, 18 * h / w + 1), constrained_layout=True)
     ax.imshow(rgb, extent=(b[0], b[2], b[1], b[3]))
     for _, q in t.head(6).iterrows(): ax.add_patch(plt.Rectangle((q.lon, q.lat), TT, TT, fill=False, ec='yellow', lw=1.2))
-    ax.set_title(f'patch rule: red = patch removed (p{PCT:g} event coh > {T:g}, patch >= {MINKM2:g} km2), cyan kept; blue permanent; black 250; white 100; pink 106-115; boxes = zooms')
+    ax.set_title(f'patch rule: red = patch removed (p{PCT:g} event coh > {T:g}, patch >= {MINKM2:g} km2), cyan kept; blue permanent; black 250; white 100; pink 106; orange 116; boxes = zooms')
     fig.savefig(f'{tag}_overview.png', dpi=90); plt.close(fig)
     fig, axs = plt.subplots(2, 6, figsize=(30, 10.5), constrained_layout=True)
     for j, (_, q) in enumerate(t.head(6).iterrows()):
@@ -76,7 +76,7 @@ for T in THRS:
         v = vds.ReadAsArray(c0, r0, c1 - c0, r1 - r0)
         gg = np.clip((10 * np.log10(np.clip(v, 1e-6, None)) + 22) / 20, 0, 1); gg[~np.isfinite(gg)] = 0; im = np.dstack([gg] * 3)
         mm = m[r0:r1, c0:c1]; nn = np.isin(mm, NONP); rr = rm[r0:r1, c0:c1]
-        for msk, col in ((mm == 1, (0.15, 0.3, 1)), (mm == 100, (1, 1, 1)), ((mm > 100) & (mm < 200), (1, 0.2, 0.8)), (mm == 250, (0, 0, 0)), (nn & ~rr, (0, 0.9, 1)), (rr, (1, 0.15, 0.15))):
+        for msk, col in ((mm == 1, (0.15, 0.3, 1)), (mm == 100, (1, 1, 1)), ((mm > 100) & (mm < 116), (1, 0.2, 0.8)), (mm == 116, (1, 0.55, 0)), (mm == 250, (0, 0, 0)), (nn & ~rr, (0, 0.9, 1)), (rr, (1, 0.15, 0.15))):
             im[msk] = 0.35 * im[msk] + 0.65 * np.array(col)
         e = (gt[0] + c0 * gt[1], gt[0] + c1 * gt[1], gt[3] + r1 * gt[5], gt[3] + r0 * gt[5])
         axs[0, j].imshow(gg, cmap='gray', extent=e); axs[0, j].set_title(f'VV dB  {q.lon:.2f}, {q.lat:.2f}')
